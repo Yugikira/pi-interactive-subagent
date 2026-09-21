@@ -48,6 +48,8 @@ import {
   RUNNER_KINDS,
   isHerdrAvailable,
   isMuxAvailable,
+  isSurfaceAlive,
+  pollForExit,
   __pollForExitTest__,
 } from "../pi-extension/subagents/herdr.ts";
 import {
@@ -1362,6 +1364,35 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("applySandboxToParts supports escape: false for raw unescaped argument passing", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "worker",
+          toolAllowlist: "read,write",
+          model: "openrouter/free",
+          thinking: null,
+          systemPromptMode: "append",
+          identity: "You are a worker.",
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+        },
+        { artifactDir: d, name: "worker", escape: false },
+      );
+      const appendIdx = parts.indexOf("--append-system-prompt");
+      assert.ok(appendIdx >= 0, "expected --append-system-prompt");
+      const pathArg = parts[appendIdx + 1];
+      assert.ok(!pathArg.startsWith("'"), `path should not be single-quoted: ${pathArg}`);
+      const toolsIdx = parts.indexOf("--tools");
+      assert.ok(toolsIdx >= 0, "expected --tools");
+      assert.equal(parts[toolsIdx + 1], "read,write", "tool list should not be single-quoted");
+    });
+  });
+
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
@@ -1804,6 +1835,26 @@ describe("herdr.ts interpretExitSidecar", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
   });
+
+  it("pollForExit respects abort signal immediately", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    await assert.rejects(
+      pollForExit("any-surface", ac.signal, { interval: 100 }),
+      /Aborted while waiting/,
+    );
+  });
+
+  it("pollForExit detects when surface is not alive after grace period", async () => {
+    if (!isHerdrAvailable()) return;
+    const ac = new AbortController();
+    const result = await pollForExit("nonexistent-surface-abc-xyz", ac.signal, {
+      interval: 100,
+    });
+    assert.equal(result.reason, "error");
+    assert.equal(result.exitCode, 1);
+    assert.match(result.errorMessage ?? "", /pane was closed/);
+  });
 });
 describe("commands", () => {
   it("/subagent emits a spawn tool call for a known agent", () => {
@@ -1828,6 +1879,40 @@ describe("commands", () => {
     (subagentsModule as any).default(api);
     assert.equal(registeredCommands.find((c) => c.name === "iterate"), undefined);
     assert.equal(registeredCommands.find((c) => c.name === "plan"), undefined);
+  });
+
+  it("registers /subagent:stop and /subagents commands", () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const stopCmd = registeredCommands.find((c) => c.name === "subagent:stop");
+    assert.ok(stopCmd, "expected /subagent:stop to be registered");
+
+    let notifiedMsg = "";
+    stopCmd.handler("", { ui: { notify(msg: string) { notifiedMsg = msg; } } });
+    assert.match(notifiedMsg, /No subagents are currently running/);
+
+    const listCmd = registeredCommands.find((c) => c.name === "subagents");
+    assert.ok(listCmd, "expected /subagents to be registered");
+    let listNotified = "";
+    listCmd.handler("", { ui: { notify(msg: string) { listNotified = msg; } } });
+    assert.match(listNotified, /No subagents are currently running/);
+  });
+
+  it("/subagent handles stop and status subcommands", () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const subagent = registeredCommands.find((command) => command.name === "subagent");
+    assert.ok(subagent, "expected /subagent to be registered");
+
+    let stopMsg = "";
+    subagent.handler("stop", { ui: { notify(msg: string) { stopMsg = msg; } } });
+    assert.match(stopMsg, /No subagents are currently running/);
+
+    let statusMsg = "";
+    subagent.handler("status", { ui: { notify(msg: string) { statusMsg = msg; } } });
+    assert.match(statusMsg, /No subagents are currently running/);
   });
 });
 
@@ -1946,6 +2031,79 @@ describe("tool registration", () => {
     const names = registeredTools.map((tool) => tool.name);
     assert.equal(names.includes("subagent_interrupt"), false);
     assert.equal(names.includes("subagent_resume"), false);
+  });
+
+  it("registers subagent_stop tool with optional name and closePane", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const stopTool = registeredTools.find((t) => t.name === "subagent_stop");
+    assert.ok(stopTool, "expected subagent_stop tool to be registered");
+
+    const props = stopTool.parameters.properties;
+    assert.deepEqual(Object.keys(props).sort(), ["closePane", "name"]);
+    assert.equal(props.name.type, "string");
+    assert.equal(props.closePane.type, "boolean");
+    assert.equal(stopTool.parameters.required, undefined);
+  });
+
+  it("subagent_stop tool handles execution for missing, matching, and ambiguous agents", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    const stopTool = registeredTools.find((t) => t.name === "subagent_stop");
+    assert.ok(stopTool);
+
+    // 1. None running
+    const resNone = await stopTool.execute("call-1", {});
+    assert.equal(resNone.details?.reason, "none_running");
+
+    // Setup running agents
+    let aborted1 = false;
+    let aborted2 = false;
+    runningMap.set("a1", {
+      id: "a1",
+      name: "worker",
+      surface: "p1",
+      abortController: { abort() { aborted1 = true; } },
+    });
+    runningMap.set("a2", {
+      id: "a2",
+      name: "scout",
+      surface: "p2",
+      abortController: { abort() { aborted2 = true; } },
+    });
+
+    try {
+      // 2. Ambiguous when multiple running and name omitted
+      const resAmbiguous = await stopTool.execute("call-2", {});
+      assert.equal(resAmbiguous.details?.error, "ambiguous");
+
+      // 3. Not found
+      const resNotFound = await stopTool.execute("call-3", { name: "ghost" });
+      assert.equal(resNotFound.details?.error, "not_found");
+
+      // 4. Success stopping one subagent by name
+      const resSuccess = await stopTool.execute("call-4", { name: "worker", closePane: false });
+      assert.equal(resSuccess.details?.stopped, true);
+      assert.equal(resSuccess.details?.name, "worker");
+      assert.equal(aborted1, true);
+      assert.equal(runningMap.has("a1"), false);
+      assert.equal(runningMap.has("a2"), true);
+
+      // 5. Single running subagent can be stopped with name omitted
+      const resSingle = await stopTool.execute("call-5", { closePane: false });
+      assert.equal(resSingle.details?.stopped, true);
+      assert.equal(resSingle.details?.name, "scout");
+      assert.equal(aborted2, true);
+      assert.equal(runningMap.size, 0);
+    } finally {
+      runningMap.clear();
+    }
   });
 });
 
@@ -2399,6 +2557,116 @@ describe("subagent interruption", () => {
     assert.doesNotMatch(presentation, /Session id:/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
   });
+
+  describe("stopSubagentByName", () => {
+    it("reports when no subagents are running", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+
+      assert.match(testApi.stopSubagentByName(), /No subagents are currently running/);
+      assert.match(testApi.stopSubagentByName("all"), /No subagents are currently running/);
+      assert.match(testApi.stopSubagentByName("worker"), /No running subagent named "worker"/);
+    });
+
+    it("stops a single subagent when targetName is omitted", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+
+      let aborted = false;
+      runningMap.set("a1", makeRunning({
+        id: "a1",
+        name: "Worker",
+        abortController: { abort() { aborted = true; } },
+      }));
+
+      try {
+        const result = testApi.stopSubagentByName();
+        assert.match(result, /Subagent "Worker" stopped/);
+        assert.equal(aborted, true);
+        assert.equal(runningMap.size, 0);
+      } finally {
+        runningMap.clear();
+      }
+    });
+
+    it("stops matching subagent by name case-insensitively", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+
+      let aborted1 = false;
+      let aborted2 = false;
+      runningMap.set("a1", makeRunning({
+        id: "a1",
+        name: "Worker-Alpha",
+        abortController: { abort() { aborted1 = true; } },
+      }));
+      runningMap.set("a2", makeRunning({
+        id: "a2",
+        name: "Scout-Beta",
+        abortController: { abort() { aborted2 = true; } },
+      }));
+
+      try {
+        const result = testApi.stopSubagentByName("worker-alpha");
+        assert.match(result, /Subagent "Worker-Alpha" stopped/);
+        assert.equal(aborted1, true);
+        assert.equal(aborted2, false);
+        assert.equal(runningMap.has("a1"), false);
+        assert.equal(runningMap.has("a2"), true);
+      } finally {
+        runningMap.clear();
+      }
+    });
+
+    it("stops all subagents when targetName is 'all'", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+
+      let aborted1 = false;
+      let aborted2 = false;
+      runningMap.set("a1", makeRunning({
+        id: "a1",
+        name: "Worker-1",
+        abortController: { abort() { aborted1 = true; } },
+      }));
+      runningMap.set("a2", makeRunning({
+        id: "a2",
+        name: "Worker-2",
+        abortController: { abort() { aborted2 = true; } },
+      }));
+
+      try {
+        const result = testApi.stopSubagentByName("all");
+        assert.match(result, /All subagents stopped \(2 stopped\)/);
+        assert.equal(aborted1, true);
+        assert.equal(aborted2, true);
+        assert.equal(runningMap.size, 0);
+      } finally {
+        runningMap.clear();
+      }
+    });
+
+    it("returns disambiguation message when multiple are running and targetName is omitted", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+
+      runningMap.set("a1", makeRunning({ id: "a1", name: "Worker-1" }));
+      runningMap.set("a2", makeRunning({ id: "a2", name: "Worker-2" }));
+
+      try {
+        const result = testApi.stopSubagentByName();
+        assert.match(result, /Multiple subagents running: Worker-1, Worker-2/);
+        assert.equal(runningMap.size, 2);
+      } finally {
+        runningMap.clear();
+      }
+    });
+  });
 });
 
 describe("subagent status renderer", () => {
@@ -2675,6 +2943,12 @@ describe("herdr.ts", () => {
   describe("availability", () => {
     it("isMuxAvailable delegates to isHerdrAvailable", () => {
       assert.equal(isMuxAvailable(), isHerdrAvailable());
+    });
+
+    it("isSurfaceAlive returns false when Herdr is unavailable or pane does not exist", () => {
+      const result = isSurfaceAlive("nonexistent-pane-99999");
+      assert.equal(typeof result, "boolean");
+      assert.equal(result, false);
     });
   });
 

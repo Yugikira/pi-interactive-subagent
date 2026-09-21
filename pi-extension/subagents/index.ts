@@ -23,6 +23,7 @@ import {
   sendLongCommand,
   pollForExit,
   closeSurface,
+  isSurfaceAlive,
   shellEscape,
   readScreen,
   startAgent,
@@ -912,11 +913,14 @@ function buildSubagentToolAllowlist(
 function applySandboxToParts(
   parts: string[],
   loadout: SubagentLoadout,
-  opts: { artifactDir: string; name: string },
+  opts: { artifactDir: string; name: string; escape?: boolean },
 ): void {
+  const esc = opts.escape !== false;
+  const wrap = (s: string) => (esc ? shellEscape(s) : s);
+
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
-    parts.push("--model", shellEscape(model));
+    parts.push("--model", wrap(model));
   }
 
   if (loadout.identity) {
@@ -931,7 +935,7 @@ function applySandboxToParts(
     const spPath = join(opts.artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
     mkdirSync(dirname(spPath), { recursive: true });
     writeFileSync(spPath, loadout.identity, "utf8");
-    parts.push(flag, shellEscape(spPath));
+    parts.push(flag, wrap(spPath));
   }
 
   // Default-deny: disable global extension discovery and re-enable only the
@@ -939,7 +943,7 @@ function applySandboxToParts(
   // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
-    parts.push("--tools", shellEscape(loadout.toolAllowlist));
+    parts.push("--tools", wrap(loadout.toolAllowlist));
 
     const extPaths = new Set<string>();
     for (const tool of loadout.toolAllowlist.split(",")) {
@@ -947,7 +951,7 @@ function applySandboxToParts(
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
     for (const extPath of extPaths) {
-      parts.push("-e", shellEscape(extPath));
+      parts.push("-e", wrap(extPath));
     }
   }
 }
@@ -1120,22 +1124,25 @@ function steerSubagent(
   send: (surface: string, command: string) => void = sendCommand,
 ): { ok: true } | { error: string } {
   try {
+    const nextTurn = (running.turn ?? 1) + 1;
+    running.turn = nextTurn;
+    running.turnStartTime = Date.now();
+
     if (
-      running.cli &&
-      running.cli !== "pi" &&
       running.herdrAgentName &&
       isHerdrAvailable() &&
       send === sendCommand
     ) {
-      const nextTurn = (running.turn ?? 1) + 1;
-      running.turn = nextTurn;
-      running.turnStartTime = Date.now();
       const promptText =
         running.recordFile && !isNativeSessionRunner(running.cli)
           ? formatNonPiPrompt(message, running.recordFile, nextTurn)
           : message;
-      promptAgent(running.herdrAgentName, promptText);
-      return { ok: true };
+      try {
+        promptAgent(running.herdrAgentName, promptText);
+        return { ok: true };
+      } catch {
+        // Fallback to sending command to surface directly
+      }
     }
     const flattened = message.replace(/\s*\n\s*/g, " ").trim();
     send(running.surface, flattened);
@@ -1181,6 +1188,51 @@ function handleSubagentSteer(
 
   running.statusState = forceStatusAfterInterrupt(running.statusState, now);
   updateWidget();
+
+  // If the previous turn's watcher has completed (or was aborted), re-arm watchSubagent
+  // so the orchestrator receives the subagent's response for this new turn.
+  if (running.interactive && send === sendCommand && latestPi && (!running.abortController || running.abortController.signal.aborted)) {
+    const watcherAbort = new AbortController();
+    running.abortController = watcherAbort;
+    watchSubagent(running, watcherAbort.signal)
+      .then((result) => {
+        updateWidget();
+        const presentation = resolveResultPresentation(result, running.name);
+        latestPi?.sendMessage(
+          {
+            customType: "subagent_result",
+            content: presentation,
+            display: true,
+            details: {
+              name: running.name,
+              task: running.task,
+              agent: running.agent,
+              cli: running.cli,
+              exitCode: result.exitCode,
+              elapsed: result.elapsed,
+              sessionFile: result.sessionFile,
+              ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+              ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+              ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+              ...(result.stats ? { stats: result.stats } : {}),
+            },
+          },
+          { triggerTurn: true, deliverAs: "steer" },
+        );
+      })
+      .catch((err) => {
+        updateWidget();
+        latestPi?.sendMessage(
+          {
+            customType: "subagent_result",
+            content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+            display: true,
+            details: { name: running.name, task: running.task, error: err?.message },
+          },
+          { triggerTurn: true, deliverAs: "steer" },
+        );
+      });
+  }
 
   return {
     content: [{
@@ -1257,6 +1309,50 @@ function resolveResumeLaunchBehavior(keepOpen?: boolean): { autoExit: boolean; i
   return { autoExit: true, interactive: false };
 }
 
+function stopSubagentByName(targetName?: string): string {
+  const trimmed = targetName?.trim();
+  if (trimmed === "all") {
+    if (runningSubagents.size === 0) {
+      return "No subagents are currently running.";
+    }
+    const count = runningSubagents.size;
+    for (const [_id, running] of runningSubagents) {
+      running.abortController?.abort();
+      closeSurface(running.surface);
+    }
+    runningSubagents.clear();
+    updateWidget();
+    return `All subagents stopped (${count} stopped).`;
+  }
+  if (trimmed) {
+    const match = Array.from(runningSubagents.values()).find(
+      (r) => r.name.toLowerCase() === trimmed.toLowerCase(),
+    );
+    if (!match) {
+      const names = Array.from(runningSubagents.values()).map((r) => r.name);
+      return `No running subagent named "${trimmed}". Currently running: ${names.join(", ") || "none"}.`;
+    }
+    match.abortController?.abort();
+    closeSurface(match.surface);
+    runningSubagents.delete(match.id);
+    updateWidget();
+    return `Subagent "${match.name}" stopped.`;
+  }
+  if (runningSubagents.size === 0) {
+    return "No subagents are currently running.";
+  }
+  if (runningSubagents.size === 1) {
+    const only = Array.from(runningSubagents.values())[0];
+    only.abortController?.abort();
+    closeSurface(only.surface);
+    runningSubagents.delete(only.id);
+    updateWidget();
+    return `Subagent "${only.name}" stopped.`;
+  }
+  const names = Array.from(runningSubagents.values()).map((r) => r.name);
+  return `Multiple subagents running: ${names.join(", ")}. Use /subagent:stop <name> or /subagent:stop all.`;
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1285,6 +1381,7 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
+  stopSubagentByName,
   formatNonPiPrompt,
   formatElapsed,
   formatTokens,
@@ -1503,12 +1600,13 @@ async function launchSubagent(
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
 
-  // Build pi command
-  const parts: string[] = ["pi"];
-  parts.push("--session", shellEscape(subagentSessionFile));
-
-  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
+  // Build pi CLI arguments (raw, unescaped for startAgent)
+  const rawArgs: string[] = [
+    "--session",
+    subagentSessionFile,
+    "-e",
+    subagentDonePath,
+  ];
 
   const resolvedAgentDir =
     localAgentDir && existsSync(localAgentDir)
@@ -1531,27 +1629,7 @@ async function launchSubagent(
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
-  applySandboxToParts(parts, loadout, { artifactDir, name: displayName });
-
-  const envParts: string[] = [];
-  if (resolvedAgentDir) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
-  }
-  if (grantSpawning && agentDefs?.subagentAgents) {
-    envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
-  }
-  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(displayName)}`);
-  if (agentName) {
-    envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(agentName)}`);
-  }
-  if (agentDefs?.autoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-  }
-  envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
-  envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-  envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-  envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
-  const envPrefix = envParts.join(" ") + " ";
+  applySandboxToParts(rawArgs, loadout, { artifactDir, name: displayName, escape: false });
 
   let taskArg: string;
   if (launchBehavior.taskDelivery === "direct") {
@@ -1576,13 +1654,43 @@ async function launchSubagent(
     taskDelivery: launchBehavior.taskDelivery,
     taskArg,
   })) {
-    parts.push(shellEscape(promptArg));
+    rawArgs.push(promptArg);
   }
 
-  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-  const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
   const ext = process.platform === "win32" ? "ps1" : "sh";
+  let fallbackCommand: string;
+  if (process.platform === "win32") {
+    const pwshEnvParts: string[] = [];
+    if (resolvedAgentDir) pwshEnvParts.push(`$env:PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)};`);
+    if (grantSpawning && agentDefs?.subagentAgents) pwshEnvParts.push(`$env:PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))};`);
+    pwshEnvParts.push(`$env:PI_SUBAGENT_NAME=${shellEscape(displayName)};`);
+    if (agentName) pwshEnvParts.push(`$env:PI_SUBAGENT_AGENT=${shellEscape(agentName)};`);
+    if (agentDefs?.autoExit) pwshEnvParts.push(`$env:PI_SUBAGENT_AUTO_EXIT="1";`);
+    pwshEnvParts.push(`$env:PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)};`);
+    pwshEnvParts.push(`$env:PI_SUBAGENT_ID=${shellEscape(id)};`);
+    pwshEnvParts.push(`$env:PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)};`);
+    pwshEnvParts.push(`$env:PI_SUBAGENT_SURFACE=${shellEscape(surface)};`);
+
+    const cdCmd = effectiveCwd ? `Set-Location ${shellEscape(effectiveCwd)}; ` : "";
+    const escapedArgs = rawArgs.map(shellEscape).join(" ");
+    fallbackCommand = `${cdCmd}${pwshEnvParts.join(" ")} & pi ${escapedArgs}; echo "__SUBAGENT_DONE_$LASTEXITCODE__"`;
+  } else {
+    const envParts: string[] = [];
+    if (resolvedAgentDir) envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
+    if (grantSpawning && agentDefs?.subagentAgents) envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
+    envParts.push(`PI_SUBAGENT_NAME=${shellEscape(displayName)}`);
+    if (agentName) envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(agentName)}`);
+    if (agentDefs?.autoExit) envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+    envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
+    envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+    envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+    envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+    const envPrefix = envParts.join(" ") + " ";
+    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+    const escapedArgs = rawArgs.map(shellEscape).join(" ");
+    fallbackCommand = `${cdPrefix}${envPrefix}pi ${escapedArgs}; echo '__SUBAGENT_DONE_'$?'__'`;
+  }
+
   const launchScriptName = `${(displayName || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1593,10 +1701,10 @@ async function launchSubagent(
 
   try {
     startAgent(herdrAgentName, "pi", surface, {
-      args: parts.slice(1),
+      args: rawArgs,
     });
   } catch {
-    sendLongCommand(surface, command, {
+    sendLongCommand(surface, fallbackCommand, {
       scriptPath: launchScriptFile,
       scriptPreamble: [
         `# Subagent launch script for ${displayName}`,
@@ -1789,7 +1897,13 @@ async function watchSubagent(
       if (!running.interactive && result.exitCode === 0) {
         closeSurface(surface);
       }
-      runningSubagents.delete(running.id);
+      if (!running.interactive || !isSurfaceAlive(surface)) {
+        runningSubagents.delete(running.id);
+      } else {
+        running.abortController = undefined;
+        running.turn = (running.turn ?? 1) + 1;
+        running.turnStartTime = Date.now();
+      }
 
       return {
         name,
@@ -1826,8 +1940,16 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
-    runningSubagents.delete(running.id);
+    if (!running.interactive && result.exitCode === 0) {
+      closeSurface(surface);
+    }
+    if (!running.interactive || !isSurfaceAlive(surface)) {
+      runningSubagents.delete(running.id);
+    } else {
+      running.abortController = undefined;
+      running.turn = (running.turn ?? 1) + 1;
+      running.turnStartTime = Date.now();
+    }
 
     return {
       name,
@@ -2445,9 +2567,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Resume in the subagent's original cwd so its tools (safe_bash, edits)
         // operate where they did before.
-        const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
-
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const resumeExt = process.platform === "win32" ? "ps1" : "sh";
+        let command: string;
+        if (process.platform === "win32") {
+          const pwshEnvParts: string[] = [];
+          if (resumeAgentDir) pwshEnvParts.push(`$env:PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)};`);
+          if (loadout.spawnable && loadout.spawnable.length > 0) pwshEnvParts.push(`$env:PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))};`);
+          if (loadout.agent) pwshEnvParts.push(`$env:PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)};`);
+          pwshEnvParts.push(`$env:PI_SUBAGENT_NAME=${shellEscape(name)};`);
+          pwshEnvParts.push(`$env:PI_SUBAGENT_SESSION=${shellEscape(sessionPath)};`);
+          pwshEnvParts.push(`$env:PI_SUBAGENT_ID=${shellEscape(id)};`);
+          pwshEnvParts.push(`$env:PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)};`);
+          if (autoExit) pwshEnvParts.push(`$env:PI_SUBAGENT_AUTO_EXIT="1";`);
+          const cdCmd = loadout.cwd ? `Set-Location ${shellEscape(loadout.cwd)}; ` : "";
+          command = `${cdCmd}${pwshEnvParts.join(" ")} & ${parts.join(" ")}; echo "__SUBAGENT_DONE_$LASTEXITCODE__"`;
+        } else {
+          command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        }
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2456,7 +2592,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/[^a-z0-9\s-]/g, "")
             .replace(/\s+/g, "-")
             .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
+            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.${resumeExt}`,
         );
         sendLongCommand(surface, command, {
           scriptPath: launchScriptFile,
@@ -2557,23 +2693,146 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // /subagent command — spawn a subagent by name or runner
+  // ── subagent_stop tool ──
+  pi.registerTool({
+    name: "subagent_stop",
+    label: "Stop Subagent",
+    description:
+      "Stop a running subagent, abort its background watcher, dismiss its UI widget, and optionally close its pane in Herdr. " +
+      "Use this when a subagent is no longer needed, was closed by the user, has errored or stalled, or needs to be terminated.",
+    promptSnippet:
+      "Stop a running subagent by name, dismiss its UI widget, and optionally close its pane.",
+    parameters: Type.Object({
+      name: Type.Optional(
+        Type.String({
+          description:
+            "Display name of the subagent to stop. If omitted and only one subagent is running, stops that subagent.",
+        }),
+      ),
+      closePane: Type.Optional(
+        Type.Boolean({
+          description: "Whether to close the pane in Herdr. Defaults to true.",
+        }),
+      ),
+    }),
+
+    renderCall(args, theme) {
+      const target = args.name ?? "(current)";
+      return new Text(
+        "○ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — stop"),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as any;
+      if (details?.stopped) {
+        return new Text(
+          theme.fg("success", "✓") +
+            " " +
+            theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
+            theme.fg("dim", " — stopped"),
+          0,
+          0,
+        );
+      }
+      const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+      return new Text(theme.fg("dim", text), 0, 0);
+    },
+
+    async execute(_toolCallId, params) {
+      if (runningSubagents.size === 0) {
+        return {
+          content: [{ type: "text", text: "No subagents are currently running." }],
+          details: { stopped: false, reason: "none_running" },
+        };
+      }
+
+      let target: RunningSubagent | undefined;
+      if (params.name?.trim()) {
+        const requested = params.name.trim().toLowerCase();
+        target = Array.from(runningSubagents.values()).find(
+          (r) => r.name.toLowerCase() === requested,
+        );
+        if (!target) {
+          const names = Array.from(runningSubagents.values()).map((r) => r.name);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No running subagent named "${params.name.trim()}". Currently running: ${names.join(", ")}.`,
+              },
+            ],
+            details: { stopped: false, error: "not_found" },
+          };
+        }
+      } else if (runningSubagents.size === 1) {
+        target = Array.from(runningSubagents.values())[0];
+      } else {
+        const names = Array.from(runningSubagents.values()).map((r) => r.name);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Multiple subagents are running (${names.join(", ")}). Please specify the name of the subagent to stop.`,
+            },
+          ],
+          details: { stopped: false, error: "ambiguous" },
+        };
+      }
+
+      target.abortController?.abort();
+      if (params.closePane !== false) {
+        closeSurface(target.surface);
+      }
+      runningSubagents.delete(target.id);
+      updateWidget();
+
+      return {
+        content: [{ type: "text", text: `Sub-agent "${target.name}" stopped and dismissed.` }],
+        details: { stopped: true, name: target.name, id: target.id },
+      };
+    },
+  });
+
+  // /subagent command — spawn or manage subagents
   pi.registerCommand("subagent", {
-    description: "Spawn a subagent: /subagent <agent|cli> [task]",
+    description: "Manage subagents: /subagent <agent|cli> [task] | /subagent stop [name] | /subagent status",
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       if (!trimmed) {
-        ctx.ui.notify("Usage: /subagent <agent|cli> [task]", "warning");
+        ctx.ui.notify("Usage: /subagent <agent|cli> [task] | /subagent stop [name] | /subagent status", "warning");
         return;
       }
 
       const spaceIdx = trimmed.indexOf(" ");
       const target = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
-      const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+      const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+
+      if (target.toLowerCase() === "stop" || target.toLowerCase() === "kill") {
+        const msg = stopSubagentByName(rest);
+        ctx.ui.notify(msg, msg.includes("No running") || msg.includes("Multiple") ? "warning" : "info");
+        return;
+      }
+
+      if (target.toLowerCase() === "status" || target.toLowerCase() === "list") {
+        if (runningSubagents.size === 0) {
+          ctx.ui.notify("No subagents are currently running.", "info");
+          return;
+        }
+        const lines = Array.from(runningSubagents.values()).map((r) => {
+          const elapsed = formatElapsedMMSS(r.startTime);
+          const snapshot = classifyStatus(r.statusState, Date.now());
+          return `• ${r.name} [${r.cli}] (${elapsed}, ${snapshot.kind})`;
+        });
+        ctx.ui.notify(`Running subagents:\n${lines.join("\n")}`, "info");
+        return;
+      }
 
       const runner = normalizeRunner(target);
       if (runner) {
-        const taskText = task || `You are the ${runner} agent. Wait for instructions.`;
+        const taskText = rest || `You are the ${runner} agent. Wait for instructions.`;
         const displayName = runner[0].toUpperCase() + runner.slice(1);
         const toolCall = `Use subagent with cli: "${runner}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
         pi.sendUserMessage(toolCall);
@@ -2589,10 +2848,36 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const taskText = task || `You are the ${target} agent. Wait for instructions.`;
+      const taskText = rest || `You are the ${target} agent. Wait for instructions.`;
       const displayName = target[0].toUpperCase() + target.slice(1);
       const toolCall = `Use subagent with agent: "${target}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
+    },
+  });
+
+  // /subagent:stop command — convenience command to stop a running subagent
+  pi.registerCommand("subagent:stop", {
+    description: "Stop a running subagent: /subagent:stop [name|all]",
+    handler: async (args, ctx) => {
+      const msg = stopSubagentByName(args);
+      ctx.ui.notify(msg, msg.includes("No running") || msg.includes("Multiple") ? "warning" : "info");
+    },
+  });
+
+  // /subagents command — list currently running subagents
+  pi.registerCommand("subagents", {
+    description: "List currently running subagents: /subagents",
+    handler: async (_args, ctx) => {
+      if (runningSubagents.size === 0) {
+        ctx.ui.notify("No subagents are currently running.", "info");
+        return;
+      }
+      const lines = Array.from(runningSubagents.values()).map((r) => {
+        const elapsed = formatElapsedMMSS(r.startTime);
+        const snapshot = classifyStatus(r.statusState, Date.now());
+        return `• ${r.name} [${r.cli}] (${elapsed}, ${snapshot.kind})`;
+      });
+      ctx.ui.notify(`Running subagents:\n${lines.join("\n")}`, "info");
     },
   });
 

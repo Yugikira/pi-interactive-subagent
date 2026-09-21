@@ -139,6 +139,7 @@ function execHerdrSync(args: string[], options?: { timeout?: number }): string {
   return execFileSync(HERDR_BIN, args, {
     encoding: "utf8",
     timeout: options?.timeout ?? 60_000,
+    stdio: ["pipe", "pipe", "pipe"],
   });
 }
 
@@ -226,6 +227,17 @@ export function closeSurface(surface: string): void {
     execHerdrSync(["pane", "close", surface]);
   } catch {
     // Pane may have already closed; non-fatal
+  }
+}
+
+/** Check whether a pane surface still exists in Herdr. */
+export function isSurfaceAlive(surface: string): boolean {
+  if (!isHerdrAvailable()) return false;
+  try {
+    execHerdrSync(["pane", "read", surface, "--lines", "1"]);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -583,6 +595,15 @@ export async function pollForExit(
   for (;;) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
+    }
+
+    // Surface liveness check: detect if pane was closed by user or exited
+    if (isHerdrAvailable() && !isSurfaceAlive(surface) && Date.now() - start > 1000) {
+      return {
+        reason: hasObservedWorking ? "done" : "error",
+        exitCode: hasObservedWorking ? 0 : 1,
+        errorMessage: hasObservedWorking ? undefined : "Subagent pane was closed.",
+      };
     }
 
     // Fast path: check for .exit sidecar file (written by Pi's error path)
