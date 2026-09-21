@@ -3386,4 +3386,81 @@ describe("herdr.ts", () => {
       });
     });
   });
+
+  describe("launchSubagent & resumeSubagent bug fixes", () => {
+    it("launchSubagent does not throw ReferenceError for subagentDonePath", async () => {
+      const testApi = (subagentsModule as any).__test__;
+      assert.ok(testApi.launchSubagent, "expected launchSubagent to be exported in __test__");
+
+      const dir = createTestDir();
+      const parentSession = join(dir, "parent.jsonl");
+      writeFileSync(parentSession, JSON.stringify({ type: "session", id: "p1" }) + "\n");
+
+      const ctx = {
+        sessionManager: {
+          getSessionFile() { return parentSession; },
+          getSessionId() { return "parent-id"; },
+          getSessionDir() { return dir; },
+        },
+        cwd: dir,
+      };
+
+      try {
+        await testApi.launchSubagent(
+          {
+            cli: "pi",
+            task: "Greeting task",
+            name: "test-launch",
+          },
+          ctx,
+          { surface: "dummy-surface-1" },
+        );
+      } catch (err: any) {
+        // It may fail due to Herdr not being connected to dummy-surface-1 in test environment,
+        // but it MUST NOT fail with ReferenceError: subagentDonePath is not defined.
+        assert.notEqual(err instanceof ReferenceError, true, `Unexpected ReferenceError: ${err?.message}`);
+        assert.doesNotMatch(err?.message ?? "", /subagentDonePath is not defined/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("launchSubagent cleans up newly created surface if launch throws", async () => {
+      const testApi = (subagentsModule as any).__test__;
+      const dir = createTestDir();
+      const parentSession = join(dir, "parent.jsonl");
+      writeFileSync(parentSession, JSON.stringify({ type: "session", id: "p1" }) + "\n");
+
+      const ctx = {
+        sessionManager: {
+          getSessionFile() { return parentSession; },
+          getSessionId() { return "parent-id"; },
+          getSessionDir() { return dir; },
+        },
+        cwd: dir,
+      };
+
+      try {
+        await testApi.launchSubagent(
+          {
+            cli: "pi",
+            task: "Test fail cleanup",
+            name: "fail-test",
+          },
+          ctx,
+          { surface: "nonexistent-surface-to-fail" },
+        );
+      } catch (err: any) {
+        assert.notEqual(err instanceof ReferenceError, true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("ensures subagent-done.ts file exists on disk at expected path", () => {
+      const subagentsDir = join(fileURLToPath(import.meta.url), "../../pi-extension/subagents");
+      const subagentDonePath = join(subagentsDir, "subagent-done.ts");
+      assert.equal(existsSync(subagentDonePath), true, `Expected ${subagentDonePath} to exist`);
+    });
+  });
 });

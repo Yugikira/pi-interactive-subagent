@@ -1389,6 +1389,7 @@ export const __test__ = {
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
+  launchSubagent,
 };
 
 function startWidgetRefresh() {
@@ -1467,7 +1468,8 @@ async function launchSubagent(
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
-  // ── Non-Pi CLI runners (agy, claude, codex, grok, opencode) ──
+  try {
+    // ── Non-Pi CLI runners (agy, claude, codex, grok, opencode) ──
   if (effectiveRunner !== "pi") {
     const isNative = isNativeSessionRunner(effectiveRunner);
     const recordFile = isNative
@@ -1570,7 +1572,6 @@ async function launchSubagent(
     runningSubagents.set(id, running);
     return running;
   }
-
   // ── Pi CLI runner path ──
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -1599,6 +1600,8 @@ async function launchSubagent(
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+
+  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
 
   // Build pi CLI arguments (raw, unescaped for startAgent)
   const rawArgs: string[] = [
@@ -1736,6 +1739,12 @@ async function launchSubagent(
 
   runningSubagents.set(id, running);
   return running;
+  } catch (err) {
+    if (!surfacePreCreated) {
+      closeSurface(surface);
+    }
+    throw err;
+  }
 }
 
 /**
@@ -2564,6 +2573,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
+        const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
         // Resume in the subagent's original cwd so its tools (safe_bash, edits)
         // operate where they did before.

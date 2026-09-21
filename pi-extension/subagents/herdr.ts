@@ -224,7 +224,7 @@ export function createSurfaceSplit(
 export function closeSurface(surface: string): void {
   if (!isHerdrAvailable()) return;
   try {
-    execHerdrSync(["pane", "close", surface]);
+    execHerdrSync(["pane", "close", surface], { timeout: 5_000 });
   } catch {
     // Pane may have already closed; non-fatal
   }
@@ -234,7 +234,7 @@ export function closeSurface(surface: string): void {
 export function isSurfaceAlive(surface: string): boolean {
   if (!isHerdrAvailable()) return false;
   try {
-    execHerdrSync(["pane", "read", surface, "--lines", "1"]);
+    execHerdrSync(["pane", "read", surface, "--lines", "1"], { timeout: 3_000 });
     return true;
   } catch {
     return false;
@@ -438,7 +438,7 @@ export interface AgentInfo {
 export function getAgentState(target: string): AgentInfo | null {
   if (!isHerdrAvailable()) return null;
   try {
-    const raw = execHerdrSync(["agent", "get", target]);
+    const raw = execHerdrSync(["agent", "get", target], { timeout: 3_000 });
     const data = parseHerdrJson(raw);
     const agent = data?.result?.agent ?? data?.agent ?? data?.result;
     if (!agent) return null;
