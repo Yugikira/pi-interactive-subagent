@@ -12,8 +12,9 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  appendFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   isHerdrAvailable,
   isMuxAvailable,
@@ -37,7 +38,9 @@ import {
   sanitizeAgentName,
   sanitizeTerminalOutput,
   RUNNER_KINDS,
+  setHerdrLogSink,
   type CanonicalRunner,
+  type TerminateOutcome,
 } from "./herdr.ts";
 
 import {
@@ -1310,6 +1313,44 @@ function resolveResumeLaunchBehavior(keepOpen?: boolean): { autoExit: boolean; i
   return { autoExit: true, interactive: false };
 }
 
+/** Stop a subagent and return an honest outcome. */
+function terminateRunning(
+  running: RunningSubagent,
+  closePane = true,
+): TerminateOutcome {
+  return terminateSurface(running.surface, {
+    agentName: running.herdrAgentName,
+    closePane,
+  });
+}
+
+function formatStopErrors(outcome: TerminateOutcome): string {
+  const last = outcome.errors.at(-1);
+  return last ? ` (herdr: ${last})` : "";
+}
+
+/**
+ * Message for a stop. Only claims a stop when the pane is confirmed gone —
+ * an unverifiable outcome is reported as a failure, never as a success.
+ */
+function formatStopMessage(name: string, outcome: TerminateOutcome): string {
+  if (outcome.ok || outcome.paneClosed) {
+    return `Subagent "${name}" stopped.`;
+  }
+  if (outcome.reason === "unverified") {
+    return (
+      `Subagent "${name}" may still be running: Herdr could not report the state of pane ` +
+      `${outcome.surface}, so the stop could not be verified.` +
+      formatStopErrors(outcome)
+    );
+  }
+  return (
+    `Subagent "${name}" did not stop: pane ${outcome.surface} is still open. ` +
+    `Its process may still be running there — close the pane manually once you no longer need it.` +
+    formatStopErrors(outcome)
+  );
+}
+
 function stopSubagentByName(targetName?: string): string {
   const trimmed = targetName?.trim();
   if (trimmed === "all") {
@@ -1317,13 +1358,23 @@ function stopSubagentByName(targetName?: string): string {
       return "No subagents are currently running.";
     }
     const count = runningSubagents.size;
+    const stuck: string[] = [];
     for (const [_id, running] of runningSubagents) {
-      terminateSurface(running.surface, { agentName: running.herdrAgentName, closePane: true });
+      const outcome = terminateRunning(running);
       running.abortController?.abort();
+      if (!outcome.ok && !outcome.paneClosed) {
+        stuck.push(`${running.name} (${running.surface})`);
+      }
     }
     runningSubagents.clear();
     updateWidget();
-    return `All subagents stopped (${count} stopped).`;
+    if (stuck.length === 0) {
+      return `All subagents stopped (${count} stopped).`;
+    }
+    return (
+      `Stopped ${count - stuck.length} of ${count} subagents. Still running: ${stuck.join(", ")}. ` +
+      `Their panes were left open.`
+    );
   }
   if (trimmed) {
     const match = Array.from(runningSubagents.values()).find(
@@ -1333,22 +1384,22 @@ function stopSubagentByName(targetName?: string): string {
       const names = Array.from(runningSubagents.values()).map((r) => r.name);
       return `No running subagent named "${trimmed}". Currently running: ${names.join(", ") || "none"}.`;
     }
-    terminateSurface(match.surface, { agentName: match.herdrAgentName, closePane: true });
+    const outcome = terminateRunning(match);
     match.abortController?.abort();
     runningSubagents.delete(match.id);
     updateWidget();
-    return `Subagent "${match.name}" stopped.`;
+    return formatStopMessage(match.name, outcome);
   }
   if (runningSubagents.size === 0) {
     return "No subagents are currently running.";
   }
   if (runningSubagents.size === 1) {
     const only = Array.from(runningSubagents.values())[0];
-    terminateSurface(only.surface, { agentName: only.herdrAgentName, closePane: true });
+    const outcome = terminateRunning(only);
     only.abortController?.abort();
     runningSubagents.delete(only.id);
     updateWidget();
-    return `Subagent "${only.name}" stopped.`;
+    return formatStopMessage(only.name, outcome);
   }
   const names = Array.from(runningSubagents.values()).map((r) => r.name);
   return `Multiple subagents running: ${names.join(", ")}. Use /subagent:stop <name> or /subagent:stop all.`;
@@ -1383,6 +1434,8 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   runningSubagents,
   stopSubagentByName,
+  terminateRunning,
+  formatStopMessage,
   terminateSurface,
   formatNonPiPrompt,
   formatElapsed,
@@ -2005,6 +2058,25 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
+
+  // Opt-in termination diagnostics. Stop failures used to be invisible (every
+  // herdr error was swallowed and the tool always reported success), so when a
+  // stop misbehaves this log is the only way to see which probe lied.
+  if (process.env.PI_SUBAGENT_DEBUG === "1") {
+    const logFile = process.env.PI_SUBAGENT_DEBUG_FILE ?? join(tmpdir(), "pi-subagents-herdr.log");
+    try {
+      setHerdrLogSink((message) => {
+        appendFileSync(logFile, `${new Date().toISOString()} ${message}\n`);
+      });
+      appendFileSync(
+        logFile,
+        `\n${new Date().toISOString()} ── extension loaded (pid ${process.pid}, cwd ${process.cwd()}) ──\n`,
+      );
+    } catch {
+      // Never let diagnostics break extension loading.
+    }
+  }
+
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
@@ -2743,11 +2815,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     renderResult(result, _opts, theme) {
       const details = result.details as any;
       if (details?.stopped) {
+        const label = theme.fg("toolTitle", theme.bold(details.name ?? "subagent"));
         return new Text(
-          theme.fg("success", "✓") +
-            " " +
-            theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
-            theme.fg("dim", " — stopped"),
+          details.warning
+            ? theme.fg("error", "⚠") + " " + label + theme.fg("error", " — pane still open")
+            : theme.fg("success", "✓") + " " + label + theme.fg("dim", " — stopped"),
           0,
           0,
         );
@@ -2798,17 +2870,31 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       const closePane = params.closePane !== false;
-      terminateSurface(target.surface, {
-        agentName: target.herdrAgentName,
-        closePane,
-      });
+      const outcome = terminateRunning(target, closePane);
       target.abortController?.abort();
       runningSubagents.delete(target.id);
       updateWidget();
 
+      // Report a pane that survived instead of claiming a clean stop. Scoped to
+      // pi because it is the runner whose stop path was changed; every other
+      // runner keeps its previous messaging.
+      const failed = target.cli === "pi" && closePane && !outcome.ok && !outcome.paneClosed;
+      const message = formatStopMessage(target.name, outcome);
+
       return {
-        content: [{ type: "text", text: `Sub-agent "${target.name}" stopped and dismissed.` }],
-        details: { stopped: true, name: target.name, id: target.id },
+        content: [
+          {
+            type: "text",
+            text: failed ? message : `Sub-agent "${target.name}" stopped and dismissed.`,
+          },
+        ],
+        details: {
+          stopped: true,
+          name: target.name,
+          id: target.id,
+          paneClosed: outcome.paneClosed,
+          ...(failed ? { warning: message } : {}),
+        },
       };
     },
   });

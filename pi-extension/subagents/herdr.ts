@@ -16,6 +16,64 @@ const execFileAsync = promisify(execFile);
 
 const HERDR_BIN = process.platform === "win32" ? "herdr.exe" : "herdr";
 
+// ── Injectable Execution Seam ──
+
+export interface HerdrExecDeps {
+  /** Whether the herdr CLI is usable in this process. */
+  available(): boolean;
+  /** Run herdr synchronously; throws on non-zero exit (herdr's error JSON is in the message). */
+  run(args: string[], options?: { timeoutMs?: number }): string;
+}
+
+const defaultHerdrDeps: HerdrExecDeps = {
+  available: () => process.env.HERDR_ENV === "1" && hasCommand("herdr"),
+  run: (args, options) =>
+    execFileSync(HERDR_BIN, args, {
+      encoding: "utf8",
+      timeout: options?.timeoutMs ?? 60_000,
+      stdio: ["pipe", "pipe", "pipe"],
+    }),
+};
+
+let herdrDeps: HerdrExecDeps = defaultHerdrDeps;
+
+/**
+ * Override the execution seam (tests run against a fake herdr through this).
+ * Returns a restore function.
+ */
+export function setHerdrExecDeps(next: Partial<HerdrExecDeps>): () => void {
+  const previous = herdrDeps;
+  herdrDeps = { ...herdrDeps, ...next };
+  return () => {
+    herdrDeps = previous;
+  };
+}
+
+// ── Diagnostics ──
+
+export type HerdrLogFn = (message: string) => void;
+
+let herdrLogSink: HerdrLogFn | null = null;
+
+/**
+ * Install a diagnostics sink (the host wires this to a file when
+ * `PI_SUBAGENT_DEBUG=1`). Termination decisions are otherwise invisible:
+ * every failure used to be swallowed, which is what made "the pane is still
+ * open" indistinguishable from a clean stop.
+ */
+export function setHerdrLogSink(fn: HerdrLogFn | null): void {
+  herdrLogSink = fn;
+}
+
+export function logHerdr(message: string): void {
+  if (!herdrLogSink) return;
+  try {
+    herdrLogSink(message);
+  } catch {
+    // Diagnostics must never break a stop.
+  }
+}
+
 // ── Runner Kinds & Normalization ──
 
 export const RUNNER_KINDS = [
@@ -58,10 +116,23 @@ export function isKnownRunner(input?: string | null): boolean {
 // ── Availability ──
 
 const commandAvailability = new Map<string, boolean>();
+/**
+ * A failed probe is only trusted for this long. A transient `where.exe`/spawn
+ * failure must not be cached for the lifetime of a long-running session:
+ * `isHerdrAvailable()` gates the stop path, so a permanently cached `false`
+ * silently turns every stop into a no-op that still reports success.
+ */
+const COMMAND_MISS_TTL_MS = 5_000;
+const commandMisses = new Map<string, number>();
 
 function hasCommand(command: string): boolean {
   if (commandAvailability.has(command)) {
     return commandAvailability.get(command)!;
+  }
+
+  const missedAt = commandMisses.get(command);
+  if (missedAt !== undefined && Date.now() - missedAt < COMMAND_MISS_TTL_MS) {
+    return false;
   }
 
   let available = false;
@@ -76,7 +147,12 @@ function hasCommand(command: string): boolean {
     available = false;
   }
 
-  commandAvailability.set(command, available);
+  if (available) {
+    commandAvailability.set(command, true);
+    commandMisses.delete(command);
+  } else {
+    commandMisses.set(command, Date.now());
+  }
   return available;
 }
 
@@ -85,7 +161,7 @@ function hasCommand(command: string): boolean {
  * `HERDR_ENV=1` is injected by Herdr into every managed pane.
  */
 export function isHerdrAvailable(): boolean {
-  return process.env.HERDR_ENV === "1" && hasCommand("herdr");
+  return herdrDeps.available();
 }
 
 export function isMuxAvailable(): boolean {
@@ -97,7 +173,7 @@ export function muxSetupHint(): string {
 }
 
 function requireHerdr(): void {
-  if (!isHerdrAvailable()) {
+  if (!herdrDeps.available()) {
     throw new Error(`Herdr is required for subagents. ${muxSetupHint()}`);
   }
 }
@@ -136,11 +212,7 @@ export function sanitizeAgentName(name: string): string {
 
 function execHerdrSync(args: string[], options?: { timeout?: number }): string {
   requireHerdr();
-  return execFileSync(HERDR_BIN, args, {
-    encoding: "utf8",
-    timeout: options?.timeout ?? 60_000,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  return herdrDeps.run(args, { timeoutMs: options?.timeout });
 }
 
 async function execHerdrAsync(args: string[], options?: { timeout?: number }): Promise<string> {
@@ -220,24 +292,127 @@ export function createSurfaceSplit(
   return createSurface(name, { direction: herdrDir, fromSurface });
 }
 
-/** Close a pane. Returns true if the pane was closed (or was already dead). */
-export function closeSurface(surface: string): boolean {
-  if (!isHerdrAvailable()) return false;
+// ── Pane Inspection (read-only) ──
+
+export interface PaneSummary {
+  paneId: string;
+  agent?: string;
+  agentStatus?: string;
+  agentSessionValue?: string;
+  cwd?: string;
+}
+
+/** Parse a `herdr pane list` payload; null when it is not usable. */
+export function parsePaneList(raw: string): PaneSummary[] | null {
+  let data: any;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+
+  const panes = data?.result?.panes ?? data?.panes;
+  if (!Array.isArray(panes)) return null;
+
+  const summaries: PaneSummary[] = [];
+  for (const pane of panes) {
+    const paneId = pane?.pane_id;
+    if (typeof paneId !== "string" || !paneId) continue;
+    summaries.push({
+      paneId,
+      agent: typeof pane?.agent === "string" ? pane.agent : undefined,
+      agentStatus: typeof pane?.agent_status === "string" ? pane.agent_status : undefined,
+      agentSessionValue:
+        typeof pane?.agent_session?.value === "string" ? pane.agent_session.value : undefined,
+      cwd: typeof pane?.cwd === "string" ? pane.cwd : undefined,
+    });
+  }
+  return summaries;
+}
+
+/** Read the pane inventory, or null when it cannot be read. */
+export function listPanes(onError?: (message: string) => void): PaneSummary[] | null {
+  if (!herdrDeps.available()) return null;
+  try {
+    return parsePaneList(execHerdrSync(["pane", "list"], { timeout: 5_000 }));
+  } catch (err) {
+    onError?.(errorText(err));
+    return null;
+  }
+}
+
+/**
+ * Tri-state pane existence: true / false / null ("cannot tell").
+ *
+ * `pane list` is the authoritative inventory. A read failure must never be
+ * interpreted as "the pane is gone" — that conflation is what let the previous
+ * stop path report success for a pane it had never touched.
+ */
+export function paneExists(surface: string, onError?: (message: string) => void): boolean | null {
+  const panes = listPanes(onError);
+  if (!panes) return null;
+  return panes.some((pane) => pane.paneId === surface);
+}
+
+/** Pull `{"error":{"code":…,"message":…}}` out of a herdr failure message. */
+export function parseHerdrError(raw: string): { code: string; message: string } | null {
+  const code = raw.match(/"code"\s*:\s*"([^"]+)"/)?.[1];
+  const message = raw.match(/"message"\s*:\s*"([^"]+)"/)?.[1];
+  if (!code && !message) return null;
+  return { code: code ?? "unknown", message: message ?? raw.replace(/\s+/g, " ").trim() };
+}
+
+function errorText(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const parsed = parseHerdrError(raw);
+  return parsed ? `${parsed.code}: ${parsed.message}` : raw.replace(/\s+/g, " ").trim();
+}
+
+/** Close a pane. Returns true only when the pane is confirmed gone. */
+export function closeSurface(surface: string, onError?: (message: string) => void): boolean {
+  if (!herdrDeps.available()) return false;
+
+  if (paneExists(surface, onError) === false) return true;
+
+  const closed = tryClosePane(surface, onError);
+  const afterFirst = paneExists(surface, onError);
+  if (closed && afterFirst !== true) return true;
+  if (afterFirst === false) return true;
+
+  // A single transient failure should not leak a pane — retry once.
+  const retried = tryClosePane(surface, onError);
+  const afterRetry = paneExists(surface, onError);
+  if (afterRetry === false) return true;
+  return closed && retried && afterRetry === null;
+}
+
+function tryClosePane(surface: string, onError?: (message: string) => void): boolean {
   try {
     execHerdrSync(["pane", "close", surface], { timeout: 5_000 });
     return true;
-  } catch {
-    // If pane already closed, isSurfaceAlive will be false (success)
-    if (isSurfaceAlive(surface)) {
-      try {
-        execHerdrSync(["pane", "close", surface], { timeout: 5_000 });
-        return true;
-      } catch {
-        return false;
-      }
-    }
-    return true;
+  } catch (err) {
+    // Reported rather than swallowed: "the close failed" is exactly the fact
+    // that used to be invisible.
+    onError?.(errorText(err));
+    return false;
   }
+}
+
+// ── Termination ──
+
+export type TerminateMethod = "not-alive" | "keys";
+
+/** Honest outcome of a termination attempt — never claims more than was verified. */
+export interface TerminateOutcome {
+  ok: boolean;
+  surface: string;
+  paneClosed: boolean;
+  method: TerminateMethod;
+  reason?: "pane_still_alive" | "unverified";
+  /** What the termination actually did. */
+  attempted: string[];
+  /** herdr errors that used to be swallowed. */
+  errors: string[];
 }
 
 export interface TerminateSurfaceOptions {
@@ -246,42 +421,84 @@ export interface TerminateSurfaceOptions {
 }
 
 /**
- * Terminate a subagent's running process and optionally close its pane surface in Herdr.
+ * Stop a subagent's process and optionally close its pane.
  *
- * 1. Sends break/interruption keys (ctrl+c, ctrl+c) to cleanly stop the active process
- *    (via Herdr agent keys or pane keys).
- * 2. If closePane is true (default), closes the pane surface in Herdr so Herdr does not
- *    respawn a default shell or leave the pane hanging.
+ * The guarantee added here is narrow and it is the whole bug: an unreadable
+ * probe must not become a silent success. `pane list` is the authoritative
+ * inventory, and "cannot tell" (null) is never treated as "the pane is gone" —
+ * which is how a transient read failure used to skip the exit keys *and* the
+ * pane close while still reporting "stopped".
  */
 export function terminateSurface(
   surface: string,
   options?: TerminateSurfaceOptions,
-): boolean {
-  if (!isHerdrAvailable()) return false;
-  if (!isSurfaceAlive(surface)) return true;
+): TerminateOutcome {
+  const attempted: string[] = [];
+  const errors: string[] = [];
+  const onError = (message: string) => {
+    if (!errors.includes(message)) errors.push(message);
+    logHerdr(`  herdr error: ${message}`);
+  };
+  const base = { surface, attempted, errors };
 
-  // 1. Send break / interrupt keys to cleanly exit the running agent/process
+  logHerdr(`terminate surface=${surface} closePane=${options?.closePane !== false}`);
+
+  const exists = paneExists(surface, onError);
+  logHerdr(`  paneExists=${exists}`);
+  // Only a *confirmed* absence short-circuits. "Cannot tell" falls through to
+  // the actual stop attempt.
+  if (exists === false) {
+    return { ...base, ok: true, paneClosed: true, method: "not-alive" };
+  }
+
+  // Ask the runner's TUI to exit: agent keys, falling back to the raw pane.
   if (options?.agentName) {
+    let agentError: string | null = null;
     try {
       sendAgentKeys(options.agentName, ["ctrl+c", "ctrl+c"]);
-    } catch {
+      attempted.push(`agent send-keys ${options.agentName} ctrl+c ctrl+c`);
+    } catch (err) {
+      // Held back: if the pane fallback lands, the keys still arrived and this
+      // is recoverable noise rather than a failure worth reporting.
+      agentError = errorText(err);
+    }
+
+    if (agentError !== null) {
       try {
         execHerdrSync(["pane", "send-keys", surface, "ctrl+c", "ctrl+c"], { timeout: 3_000 });
-      } catch {}
+        attempted.push(`pane send-keys ${surface} ctrl+c ctrl+c`);
+      } catch (fallbackErr) {
+        onError(`${agentError}; ${errorText(fallbackErr)}`);
+      }
     }
   } else {
     try {
       execHerdrSync(["pane", "send-keys", surface, "ctrl+c", "ctrl+c"], { timeout: 3_000 });
-    } catch {}
+      attempted.push(`pane send-keys ${surface} ctrl+c ctrl+c`);
+    } catch (err) {
+      onError(errorText(err));
+    }
   }
 
-  // 2. If closePane is explicitly false, keep the pane open
   if (options?.closePane === false) {
-    return true;
+    return { ...base, ok: true, paneClosed: false, method: "keys" };
   }
 
-  // 3. Close the pane surface in Herdr
-  return closeSurface(surface);
+  // Close the pane, then verify against the inventory rather than trusting
+  // that the command "succeeded".
+  const closed = closeSurface(surface, onError);
+  const after = paneExists(surface, onError);
+  logHerdr(`  closeSurface=${closed} paneExistsAfter=${after}`);
+  if (after === false) {
+    return { ...base, ok: true, paneClosed: true, method: "keys" };
+  }
+  return {
+    ...base,
+    ok: false,
+    paneClosed: false,
+    method: "keys",
+    reason: after === true ? "pane_still_alive" : "unverified",
+  };
 }
 
 /** Check whether a pane surface still exists in Herdr. */

@@ -53,6 +53,10 @@ import {
   terminateSurface,
   pollForExit,
   __pollForExitTest__,
+  setHerdrExecDeps,
+  parsePaneList,
+  paneExists,
+  parseHerdrError,
 } from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
@@ -94,6 +98,89 @@ function makeRunning(overrides: Record<string, unknown> = {}) {
     statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
     ...overrides,
   };
+}
+
+
+// ── Fake herdr ──
+//
+// The suite may itself run inside a Herdr pane, where `HERDR_ENV=1` makes the
+// real CLI reachable. Every termination test therefore installs this fake
+// through `setHerdrExecDeps`, so nothing touches the developer's real panes.
+
+interface FakePane {
+  /** `herdr pane close` rejects for this pane. */
+  closeFails?: boolean;
+}
+
+function herdrError(code: string, message: string): string {
+  return `Command failed: herdr\n{"error":{"code":"${code}","message":"${message}"}}`;
+}
+
+/** Scripted stand-in for the herdr CLI, covering only what the stop path uses. */
+function createFakeHerdr(
+  initial: Record<string, FakePane>,
+  options?: { paneListFailsTimes?: number; keyWriteFails?: boolean; agentNames?: string[] },
+) {
+  const panes = new Map<string, FakePane>(Object.entries(initial));
+  const agentNames = new Set(options?.agentNames ?? []);
+  const calls: string[][] = [];
+  const keyWrites: string[][] = [];
+  let paneListFailures = options?.paneListFailsTimes ?? 0;
+
+  const deps = {
+    available: () => true,
+    run: (args: string[]): string => {
+      calls.push(args);
+      const [group, verb] = args;
+
+      // The authoritative inventory. A failure here must surface as "cannot
+      // tell" — never as "the pane is gone".
+      if (group === "pane" && verb === "list") {
+        if (paneListFailures > 0) {
+          paneListFailures -= 1;
+          throw new Error(herdrError("internal_error", "pane inventory unavailable"));
+        }
+        return JSON.stringify({
+          result: { panes: Array.from(panes.keys()).map((paneId) => ({ pane_id: paneId })) },
+        });
+      }
+
+      if (group === "pane" && verb === "close") {
+        const paneId = args[2];
+        const pane = panes.get(paneId);
+        if (!pane) throw new Error(herdrError("pane_not_found", `pane ${paneId} not found`));
+        if (pane.closeFails) {
+          throw new Error(herdrError("pane_close_failed", `pane ${paneId} could not be closed`));
+        }
+        panes.delete(paneId);
+        return JSON.stringify({ result: {} });
+      }
+
+      if ((group === "agent" || group === "pane") && verb === "send-keys") {
+        if (options?.keyWriteFails) {
+          throw new Error(herdrError("invalid_key", "unsupported key"));
+        }
+        if (group === "agent" && !agentNames.has(args[2])) {
+          throw new Error(herdrError("agent_not_found", `agent target ${args[2]} not found`));
+        }
+        keyWrites.push([`${group}:${args[2]}`, ...args.slice(3)]);
+        return JSON.stringify({ result: {} });
+      }
+
+      throw new Error(herdrError("invalid_request", `unhandled fake call: ${args.join(" ")}`));
+    },
+  };
+
+  return { panes, calls, keyWrites, deps };
+}
+
+/**
+ * Install an empty fake herdr world so a stop is deterministic in any
+ * environment: every surface reads as "confirmed absent" rather than depending
+ * on whether the suite happens to run inside a real Herdr pane.
+ */
+function useEmptyFakeHerdr(): () => void {
+  return setHerdrExecDeps(createFakeHerdr({}).deps);
 }
 
 function createTestDir(): string {
@@ -2597,12 +2684,14 @@ describe("subagent interruption", () => {
         abortController: { abort() { aborted = true; } },
       }));
 
+      const restoreHerdr = useEmptyFakeHerdr();
       try {
         const result = testApi.stopSubagentByName();
         assert.match(result, /Subagent "Worker" stopped/);
         assert.equal(aborted, true);
         assert.equal(runningMap.size, 0);
       } finally {
+        restoreHerdr();
         runningMap.clear();
       }
     });
@@ -2625,6 +2714,7 @@ describe("subagent interruption", () => {
         abortController: { abort() { aborted2 = true; } },
       }));
 
+      const restoreHerdr = useEmptyFakeHerdr();
       try {
         const result = testApi.stopSubagentByName("worker-alpha");
         assert.match(result, /Subagent "Worker-Alpha" stopped/);
@@ -2633,6 +2723,7 @@ describe("subagent interruption", () => {
         assert.equal(runningMap.has("a1"), false);
         assert.equal(runningMap.has("a2"), true);
       } finally {
+        restoreHerdr();
         runningMap.clear();
       }
     });
@@ -2655,6 +2746,7 @@ describe("subagent interruption", () => {
         abortController: { abort() { aborted2 = true; } },
       }));
 
+      const restoreHerdr = useEmptyFakeHerdr();
       try {
         const result = testApi.stopSubagentByName("all");
         assert.match(result, /All subagents stopped \(2 stopped\)/);
@@ -2662,6 +2754,7 @@ describe("subagent interruption", () => {
         assert.equal(aborted2, true);
         assert.equal(runningMap.size, 0);
       } finally {
+        restoreHerdr();
         runningMap.clear();
       }
     });
@@ -2679,6 +2772,161 @@ describe("subagent interruption", () => {
         assert.match(result, /Multiple subagents running: Worker-1, Worker-2/);
         assert.equal(runningMap.size, 2);
       } finally {
+        runningMap.clear();
+      }
+    });
+  });
+
+  describe("stop must not turn an unreadable probe into success", () => {
+    it("keeps the exit keys when the pane inventory cannot be read", () => {
+      // THE regression: a transient read failure was read as "the pane is gone",
+      // which skipped the keys *and* the close and still reported "stopped".
+      const world = createFakeHerdr({ "w1:p2": {} }, { paneListFailsTimes: 1 });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const outcome = terminateSurface("w1:p2", { agentName: "test" });
+        assert.equal(world.keyWrites.length > 0, true, "the exit gesture must still be sent");
+        assert.equal(outcome.ok, true);
+        assert.equal(outcome.paneClosed, true);
+        assert.equal(world.panes.has("w1:p2"), false, "the pane should be closed once verified");
+      } finally {
+        restore();
+      }
+    });
+
+    it("reports an unverifiable stop as a failure, never as success", () => {
+      const world = createFakeHerdr({ "w1:p2": {} }, { paneListFailsTimes: 99 });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const outcome = terminateSurface("w1:p2", { agentName: "test" });
+        assert.equal(outcome.ok, false);
+        assert.equal(outcome.paneClosed, false);
+        assert.equal(outcome.reason, "unverified");
+        assert.equal(world.keyWrites.length > 0, true, "an unreadable probe must not skip the keys");
+        assert.equal(outcome.errors.length > 0, true);
+      } finally {
+        restore();
+      }
+    });
+
+    it("reports failure when herdr accepts the close but the pane survives", () => {
+      const world = createFakeHerdr({ "w1:p2": { closeFails: true } });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const outcome = terminateSurface("w1:p2", { agentName: "test" });
+        assert.equal(outcome.ok, false);
+        assert.equal(outcome.paneClosed, false);
+        assert.equal(outcome.reason, "pane_still_alive");
+        assert.equal(world.panes.has("w1:p2"), true);
+      } finally {
+        restore();
+      }
+    });
+
+    it("surfaces herdr's error text instead of swallowing it", () => {
+      const world = createFakeHerdr({ "w1:p2": { closeFails: true } });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const outcome = terminateSurface("w1:p2", { agentName: "test" });
+        assert.equal(
+          outcome.errors.some((error) => /pane_close_failed/.test(error)),
+          true,
+        );
+      } finally {
+        restore();
+      }
+    });
+
+    it("sends keys through the agent name, falling back to the pane", () => {
+      const direct = createFakeHerdr({ "w1:p2": {} }, { agentNames: ["test"] });
+      const restoreDirect = setHerdrExecDeps(direct.deps);
+      try {
+        terminateSurface("w1:p2", { agentName: "test" });
+        assert.deepStrictEqual(direct.keyWrites, [["agent:test", "ctrl+c", "ctrl+c"]]);
+      } finally {
+        restoreDirect();
+      }
+
+      const fallback = createFakeHerdr({ "w1:p2": {} });
+      const restoreFallback = setHerdrExecDeps(fallback.deps);
+      try {
+        terminateSurface("w1:p2", { agentName: "test" });
+        assert.deepStrictEqual(fallback.keyWrites, [["pane:w1:p2", "ctrl+c", "ctrl+c"]]);
+      } finally {
+        restoreFallback();
+      }
+    });
+
+    it("does not type keys into a pane that is already gone", () => {
+      const world = createFakeHerdr({ "w1:p2": {} });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const outcome = terminateSurface("w9:p9", { agentName: "test" });
+        assert.equal(outcome.method, "not-alive");
+        assert.equal(outcome.ok, true);
+        assert.deepStrictEqual(world.keyWrites, []);
+      } finally {
+        restore();
+      }
+    });
+
+    it("parses the pane inventory and keeps 'unreadable' distinct from 'gone'", () => {
+      assert.deepStrictEqual(
+        parsePaneList('{"result":{"panes":[{"pane_id":"w1:p2","agent":"pi"}]}}'),
+        [
+          {
+            paneId: "w1:p2",
+            agent: "pi",
+            agentStatus: undefined,
+            agentSessionValue: undefined,
+            cwd: undefined,
+          },
+        ],
+      );
+      assert.equal(parsePaneList("{not json"), null);
+      assert.equal(parsePaneList('{"result":{}}'), null);
+      assert.equal(parseHerdrError(herdrError("pane_not_found", "pane x not found"))?.code, "pane_not_found");
+      assert.equal(parseHerdrError("plain failure"), null);
+
+      // With Herdr unreachable the answer is "cannot tell" — never "gone".
+      const restoreUnavailable = setHerdrExecDeps({ available: () => false });
+      try {
+        assert.equal(paneExists("w1:p2"), null);
+      } finally {
+        restoreUnavailable();
+      }
+    });
+
+    it("tells the user when a stop did not take effect", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      const world = createFakeHerdr({ "pane-1": { closeFails: true } });
+      const restore = setHerdrExecDeps(world.deps);
+      runningMap.clear();
+      runningMap.set("a1", makeRunning({ id: "a1", name: "stuck-bot", surface: "pane-1" }));
+      try {
+        const message = testApi.stopSubagentByName("stuck-bot");
+        assert.match(message, /did not stop/);
+        assert.match(message, /pane-1/);
+      } finally {
+        restore();
+        runningMap.clear();
+      }
+    });
+
+    it("still reports a clean stop when the pane goes away", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      const world = createFakeHerdr({ "pane-1": {} });
+      const restore = setHerdrExecDeps(world.deps);
+      runningMap.clear();
+      runningMap.set("a1", makeRunning({ id: "a1", name: "good-bot", surface: "pane-1" }));
+      try {
+        assert.match(testApi.stopSubagentByName("good-bot"), /Subagent "good-bot" stopped/);
+        assert.equal(world.panes.has("pane-1"), false);
+        assert.equal(runningMap.size, 0);
+      } finally {
+        restore();
         runningMap.clear();
       }
     });
@@ -2967,16 +3215,45 @@ describe("herdr.ts", () => {
       assert.equal(result, false);
     });
 
-    it("terminateSurface returns true for non-alive surface", () => {
-      const result = terminateSurface("nonexistent-pane-99999");
-      assert.equal(typeof result, "boolean");
-      assert.equal(result, true);
+    it("reports an unverifiable stop as a failure rather than a false success", () => {
+      const restore = setHerdrExecDeps({ available: () => false });
+      try {
+        const result = terminateSurface("nonexistent-pane-99999");
+        // Nothing can be verified, so the outcome must not claim the pane is gone.
+        assert.equal(result.ok, false);
+        assert.equal(result.paneClosed, false);
+        assert.equal(result.reason, "unverified");
+        assert.equal(result.errors.length > 0, true, "the herdr failure must be surfaced");
+      } finally {
+        restore();
+      }
+    });
+
+    it("terminateSurface reports not-alive only for a pane that is genuinely gone", () => {
+      const world = createFakeHerdr({ "w9:p9": {} });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const result = terminateSurface("nonexistent-pane-99999");
+        assert.equal(result.method, "not-alive");
+        assert.equal(result.ok, true);
+        assert.equal(result.paneClosed, true);
+        assert.deepStrictEqual(world.keyWrites, []);
+      } finally {
+        restore();
+      }
     });
 
     it("terminateSurface respects closePane: false", () => {
-      const result = terminateSurface("nonexistent-pane-99999", { closePane: false });
-      assert.equal(typeof result, "boolean");
-      assert.equal(result, true);
+      const world = createFakeHerdr({ "w1:p2": {} });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const result = terminateSurface("w1:p2", { agentName: "rev", closePane: false });
+        assert.equal(result.ok, true);
+        assert.equal(result.paneClosed, false);
+        assert.equal(world.panes.has("w1:p2"), true, "closePane: false must not close the pane");
+      } finally {
+        restore();
+      }
     });
 
     it("closeSurface returns boolean", () => {
@@ -3517,12 +3794,14 @@ describe("herdr.ts", () => {
         abortController: { abort() { aborted = true; } },
       }));
 
+      const restoreHerdr = useEmptyFakeHerdr();
       try {
         const msg = testApi.stopSubagentByName("test-bot");
         assert.match(msg, /Subagent "test-bot" stopped/);
         assert.equal(aborted, true);
         assert.equal(runningMap.has("a1"), false);
       } finally {
+        restoreHerdr();
         runningMap.clear();
       }
     });
@@ -3557,4 +3836,5 @@ describe("herdr.ts", () => {
       }
     });
   });
+
 });
