@@ -1830,6 +1830,7 @@ async function watchSubagent(
       sentinelFile: running.sentinelFile,
       agentName: herdrAgentName,
       runner: cli,
+      cwd: running.cwd,
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
@@ -1906,6 +1907,7 @@ async function watchSubagent(
       }
 
       if (!running.interactive && result.exitCode === 0) {
+        await new Promise((r) => setTimeout(r, 500));
         terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
       }
       if (!running.interactive || !isSurfaceAlive(surface)) {
@@ -1952,6 +1954,7 @@ async function watchSubagent(
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
     if (!running.interactive && result.exitCode === 0) {
+      await new Promise((r) => setTimeout(r, 500));
       terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
     }
     if (!running.interactive || !isSurfaceAlive(surface)) {
