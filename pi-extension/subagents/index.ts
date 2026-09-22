@@ -23,6 +23,7 @@ import {
   sendLongCommand,
   pollForExit,
   closeSurface,
+  terminateSurface,
   isSurfaceAlive,
   shellEscape,
   readScreen,
@@ -1317,8 +1318,8 @@ function stopSubagentByName(targetName?: string): string {
     }
     const count = runningSubagents.size;
     for (const [_id, running] of runningSubagents) {
+      terminateSurface(running.surface, { agentName: running.herdrAgentName, closePane: true });
       running.abortController?.abort();
-      closeSurface(running.surface);
     }
     runningSubagents.clear();
     updateWidget();
@@ -1332,8 +1333,8 @@ function stopSubagentByName(targetName?: string): string {
       const names = Array.from(runningSubagents.values()).map((r) => r.name);
       return `No running subagent named "${trimmed}". Currently running: ${names.join(", ") || "none"}.`;
     }
+    terminateSurface(match.surface, { agentName: match.herdrAgentName, closePane: true });
     match.abortController?.abort();
-    closeSurface(match.surface);
     runningSubagents.delete(match.id);
     updateWidget();
     return `Subagent "${match.name}" stopped.`;
@@ -1343,8 +1344,8 @@ function stopSubagentByName(targetName?: string): string {
   }
   if (runningSubagents.size === 1) {
     const only = Array.from(runningSubagents.values())[0];
+    terminateSurface(only.surface, { agentName: only.herdrAgentName, closePane: true });
     only.abortController?.abort();
-    closeSurface(only.surface);
     runningSubagents.delete(only.id);
     updateWidget();
     return `Subagent "${only.name}" stopped.`;
@@ -1382,6 +1383,7 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   runningSubagents,
   stopSubagentByName,
+  terminateSurface,
   formatNonPiPrompt,
   formatElapsed,
   formatTokens,
@@ -1741,7 +1743,7 @@ async function launchSubagent(
   return running;
   } catch (err) {
     if (!surfacePreCreated) {
-      closeSurface(surface);
+      terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
     }
     throw err;
   }
@@ -1904,7 +1906,7 @@ async function watchSubagent(
       }
 
       if (!running.interactive && result.exitCode === 0) {
-        closeSurface(surface);
+        terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
       }
       if (!running.interactive || !isSurfaceAlive(surface)) {
         runningSubagents.delete(running.id);
@@ -1950,7 +1952,7 @@ async function watchSubagent(
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
     if (!running.interactive && result.exitCode === 0) {
-      closeSurface(surface);
+      terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
     }
     if (!running.interactive || !isSurfaceAlive(surface)) {
       runningSubagents.delete(running.id);
@@ -1976,6 +1978,7 @@ async function watchSubagent(
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
+      terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
       return {
         name,
         task,
@@ -1987,6 +1990,7 @@ async function watchSubagent(
         cli: running.cli,
       };
     }
+    terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
     return {
       name,
       task,
@@ -2029,6 +2033,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
     for (const [_id, agent] of runningSubagents) {
+      terminateSurface(agent.surface, { agentName: agent.herdrAgentName, closePane: true });
       agent.abortController?.abort();
     }
     runningSubagents.clear();
@@ -2792,10 +2797,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       }
 
+      const closePane = params.closePane !== false;
+      terminateSurface(target.surface, {
+        agentName: target.herdrAgentName,
+        closePane,
+      });
       target.abortController?.abort();
-      if (params.closePane !== false) {
-        closeSurface(target.surface);
-      }
       runningSubagents.delete(target.id);
       updateWidget();
 

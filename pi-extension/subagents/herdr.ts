@@ -220,14 +220,68 @@ export function createSurfaceSplit(
   return createSurface(name, { direction: herdrDir, fromSurface });
 }
 
-/** Close a pane. */
-export function closeSurface(surface: string): void {
-  if (!isHerdrAvailable()) return;
+/** Close a pane. Returns true if the pane was closed (or was already dead). */
+export function closeSurface(surface: string): boolean {
+  if (!isHerdrAvailable()) return false;
   try {
     execHerdrSync(["pane", "close", surface], { timeout: 5_000 });
+    return true;
   } catch {
-    // Pane may have already closed; non-fatal
+    // If pane already closed, isSurfaceAlive will be false (success)
+    if (isSurfaceAlive(surface)) {
+      try {
+        execHerdrSync(["pane", "close", surface], { timeout: 5_000 });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return true;
   }
+}
+
+export interface TerminateSurfaceOptions {
+  agentName?: string;
+  closePane?: boolean;
+}
+
+/**
+ * Terminate a subagent's running process and optionally close its pane surface in Herdr.
+ *
+ * 1. Sends break/interruption keys (ctrl+c, ctrl+c) to cleanly stop the active process
+ *    (via Herdr agent keys or pane keys).
+ * 2. If closePane is true (default), closes the pane surface in Herdr so Herdr does not
+ *    respawn a default shell or leave the pane hanging.
+ */
+export function terminateSurface(
+  surface: string,
+  options?: TerminateSurfaceOptions,
+): boolean {
+  if (!isHerdrAvailable()) return false;
+  if (!isSurfaceAlive(surface)) return true;
+
+  // 1. Send break / interrupt keys to cleanly exit the running agent/process
+  if (options?.agentName) {
+    try {
+      sendAgentKeys(options.agentName, ["ctrl+c", "ctrl+c"]);
+    } catch {
+      try {
+        execHerdrSync(["pane", "send-keys", surface, "ctrl+c", "ctrl+c"], { timeout: 3_000 });
+      } catch {}
+    }
+  } else {
+    try {
+      execHerdrSync(["pane", "send-keys", surface, "ctrl+c", "ctrl+c"], { timeout: 3_000 });
+    } catch {}
+  }
+
+  // 2. If closePane is explicitly false, keep the pane open
+  if (options?.closePane === false) {
+    return true;
+  }
+
+  // 3. Close the pane surface in Herdr
+  return closeSurface(surface);
 }
 
 /** Check whether a pane surface still exists in Herdr. */

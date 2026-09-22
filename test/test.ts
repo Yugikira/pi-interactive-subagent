@@ -49,6 +49,8 @@ import {
   isHerdrAvailable,
   isMuxAvailable,
   isSurfaceAlive,
+  closeSurface,
+  terminateSurface,
   pollForExit,
   __pollForExitTest__,
 } from "../pi-extension/subagents/herdr.ts";
@@ -79,6 +81,20 @@ import {
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 
 // --- Helpers ---
+
+function makeRunning(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "a1",
+    name: "Worker",
+    task: "",
+    surface: "pane-1",
+    startTime: 0,
+    sessionFile: "worker.jsonl",
+    interactive: false,
+    statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+    ...overrides,
+  };
+}
 
 function createTestDir(): string {
   return mkdtempSync(join(tmpdir(), "subagents-test-"));
@@ -2950,6 +2966,23 @@ describe("herdr.ts", () => {
       assert.equal(typeof result, "boolean");
       assert.equal(result, false);
     });
+
+    it("terminateSurface returns true for non-alive surface", () => {
+      const result = terminateSurface("nonexistent-pane-99999");
+      assert.equal(typeof result, "boolean");
+      assert.equal(result, true);
+    });
+
+    it("terminateSurface respects closePane: false", () => {
+      const result = terminateSurface("nonexistent-pane-99999", { closePane: false });
+      assert.equal(typeof result, "boolean");
+      assert.equal(result, true);
+    });
+
+    it("closeSurface returns boolean", () => {
+      const result = closeSurface("nonexistent-pane-99999");
+      assert.equal(typeof result, "boolean");
+    });
   });
 
   describe("shellEscape", () => {
@@ -3461,6 +3494,67 @@ describe("herdr.ts", () => {
       const subagentsDir = join(fileURLToPath(import.meta.url), "../../pi-extension/subagents");
       const subagentDonePath = join(subagentsDir, "subagent-done.ts");
       assert.equal(existsSync(subagentDonePath), true, `Expected ${subagentDonePath} to exist`);
+    });
+  });
+
+  describe("subagent stop & surface termination bug fixes", () => {
+    it("exports terminateSurface from __test__ and herdr.ts", () => {
+      const testApi = (subagentsModule as any).__test__;
+      assert.equal(typeof testApi.terminateSurface, "function");
+      assert.equal(typeof terminateSurface, "function");
+    });
+
+    it("stopSubagentByName handles running subagent with terminateSurface cleanly", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+
+      let aborted = false;
+      runningMap.set("a1", makeRunning({
+        id: "a1",
+        name: "test-bot",
+        surface: "nonexistent-surface-stop-1",
+        abortController: { abort() { aborted = true; } },
+      }));
+
+      try {
+        const msg = testApi.stopSubagentByName("test-bot");
+        assert.match(msg, /Subagent "test-bot" stopped/);
+        assert.equal(aborted, true);
+        assert.equal(runningMap.has("a1"), false);
+      } finally {
+        runningMap.clear();
+      }
+    });
+
+    it("subagent_stop tool handles closePane: false without error", async () => {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+
+      const stopTool = registeredTools.find((t: any) => t.name === "subagent_stop");
+      assert.ok(stopTool);
+
+      let aborted = false;
+      runningMap.set("a1", makeRunning({
+        id: "a1",
+        name: "test-bot-2",
+        surface: "nonexistent-surface-stop-2",
+        abortController: { abort() { aborted = true; } },
+      }));
+
+      try {
+        const res = await stopTool.execute("call-stop-1", { name: "test-bot-2", closePane: false });
+        assert.equal(res.details?.stopped, true);
+        assert.equal(res.details?.name, "test-bot-2");
+        assert.equal(aborted, true);
+        assert.equal(runningMap.size, 0);
+      } finally {
+        runningMap.clear();
+      }
     });
   });
 });
