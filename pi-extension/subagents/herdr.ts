@@ -8,9 +8,10 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { getNativeSessionFile } from "./session.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -501,8 +502,11 @@ export function terminateSurface(
   };
 }
 
+let surfaceAliveOverride: ((surface: string) => boolean) | null = null;
+
 /** Check whether a pane surface still exists in Herdr. */
 export function isSurfaceAlive(surface: string): boolean {
+  if (surfaceAliveOverride) return surfaceAliveOverride(surface);
   if (!isHerdrAvailable()) return false;
   try {
     execHerdrSync(["pane", "read", surface, "--lines", "1"], { timeout: 3_000 });
@@ -559,8 +563,11 @@ export function sendLongCommand(
   return scriptPath;
 }
 
+let readScreenOverride: ((surface: string, lines?: number) => string) | null = null;
+
 /** Read the screen contents of a pane (sync). */
 export function readScreen(surface: string, lines = 50): string {
+  if (readScreenOverride) return readScreenOverride(surface, lines);
   if (!isHerdrAvailable()) return "";
   try {
     return execHerdrSync([
@@ -579,6 +586,7 @@ export function readScreen(surface: string, lines = 50): string {
 
 /** Read the screen contents of a pane (async). */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
+  if (readScreenOverride) return readScreenOverride(surface, lines);
   if (!isHerdrAvailable()) return "";
   try {
     return await execHerdrAsync([
@@ -703,10 +711,13 @@ export interface AgentInfo {
   raw?: any;
 }
 
+let agentStateOverride: ((target: string) => AgentInfo | null) | null = null;
+
 /**
  * Inspect the current state of an agent via `herdr agent get <target>`.
  */
 export function getAgentState(target: string): AgentInfo | null {
+  if (agentStateOverride) return agentStateOverride(target);
   if (!isHerdrAvailable()) return null;
   try {
     const raw = execHerdrSync(["agent", "get", target], { timeout: 3_000 });
@@ -840,7 +851,18 @@ export function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
+export const __pollForExitTest__ = {
+  interpretExitSidecar,
+  setAgentStateOverride: (fn: ((target: string) => AgentInfo | null) | null) => {
+    agentStateOverride = fn;
+  },
+  setSurfaceAliveOverride: (fn: ((surface: string) => boolean) | null) => {
+    surfaceAliveOverride = fn;
+  },
+  setReadScreenOverride: (fn: ((surface: string, lines?: number) => string) | null) => {
+    readScreenOverride = fn;
+  },
+};
 
 export interface PollForExitOptions {
   interval: number;
@@ -848,6 +870,8 @@ export interface PollForExitOptions {
   sentinelFile?: string;
   agentName?: string;
   runner?: CanonicalRunner;
+  cwd?: string;
+  idleSettleCount?: number;
   onTick?: (elapsed: number) => void;
 }
 
@@ -862,6 +886,9 @@ export async function pollForExit(
 ): Promise<PollResult> {
   const start = Date.now();
   let hasObservedWorking = false;
+  let consecutiveIdleCount = 0;
+  let consecutiveNullCount = 0;
+  const IDLE_SETTLE_COUNT = options.idleSettleCount ?? 3;
 
   for (;;) {
     if (signal.aborted) {
@@ -902,18 +929,51 @@ export async function pollForExit(
     if (options.agentName) {
       const stateInfo = getAgentState(options.agentName);
       if (stateInfo) {
+        consecutiveNullCount = 0;
         if (stateInfo.state === "working") {
           hasObservedWorking = true;
-        } else if (hasObservedWorking && (stateInfo.state === "idle" || stateInfo.state === "done")) {
-          // Agent completed its active turn
+          consecutiveIdleCount = 0;
+        } else if (stateInfo.state === "done") {
           return { reason: "done", exitCode: 0 };
-        } else if (!hasObservedWorking && Date.now() - start > 3000 && (stateInfo.state === "idle" || stateInfo.state === "done")) {
-          // Agent completed quickly or was already idle after prompt delivery
-          return { reason: "done", exitCode: 0 };
+        } else if (hasObservedWorking && stateInfo.state === "idle") {
+          // For Pi runner: Herdr's screen detector seeing "idle" does NOT mean completion.
+          // Pi subagents are autonomous processes that terminate via ctx.shutdown() when finished,
+          // which shuts down the process / closes the pane. While Pi is running, "idle" simply means
+          // it is waiting (e.g. for child subagents like scout/researcher, ask_question reply, or tool execution).
+          if (options.runner !== "pi") {
+            let isActivelyWriting = false;
+            if (options.runner === "agy" || options.runner === "claude") {
+              try {
+                const nativeFile = getNativeSessionFile({
+                  runner: options.runner,
+                  sessionId: stateInfo.sessionId,
+                  cwd: options.cwd,
+                });
+                if (nativeFile && existsSync(nativeFile)) {
+                  const mtime = statSync(nativeFile).mtimeMs;
+                  if (Date.now() - mtime < 3000) {
+                    isActivelyWriting = true;
+                  }
+                }
+              } catch {}
+            }
+
+            if (isActivelyWriting) {
+              consecutiveIdleCount = 0;
+            } else {
+              consecutiveIdleCount++;
+              if (consecutiveIdleCount >= IDLE_SETTLE_COUNT) {
+                return { reason: "done", exitCode: 0 };
+              }
+            }
+          }
         }
       } else if (hasObservedWorking) {
-        // Agent was running and has now exited/cleared from the pane
-        return { reason: "done", exitCode: 0 };
+        consecutiveNullCount++;
+        if (consecutiveNullCount >= 2 || !isSurfaceAlive(surface)) {
+          // Agent was running and has now exited/cleared from the pane
+          return { reason: "done", exitCode: 0 };
+        }
       }
     }
 

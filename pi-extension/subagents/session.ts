@@ -1031,3 +1031,105 @@ export function readRunnerSession(options: ReadRunnerSessionOptions): string | n
   }
 }
 
+export interface GetNativeSessionFileOptions {
+  runner: string;
+  sessionId?: string;
+  cwd?: string;
+  brainDir?: string;
+  projectsDir?: string;
+}
+
+/**
+ * Resolves the active transcript / session file path for a native session runner (agy, claude).
+ * Returns null if not found or runner is not native.
+ */
+export function getNativeSessionFile(options: GetNativeSessionFileOptions): string | null {
+  const runner = options.runner.toLowerCase();
+
+  if (runner === "agy") {
+    const baseBrainDir =
+      options.brainDir ?? join(homedir(), ".gemini", "antigravity-cli", "brain");
+    if (!existsSync(baseBrainDir)) return null;
+
+    let sessionFolder: string | null = null;
+    if (options.sessionId) {
+      const candidate = join(baseBrainDir, options.sessionId);
+      if (existsSync(candidate)) {
+        sessionFolder = candidate;
+      }
+    }
+
+    if (!sessionFolder) {
+      try {
+        const entries = readdirSync(baseBrainDir, { withFileTypes: true });
+        let newestTime = 0;
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+          const candidateFolder = join(baseBrainDir, entry.name);
+          try {
+            const stats = statSync(candidateFolder);
+            if (stats.mtimeMs > newestTime) {
+              newestTime = stats.mtimeMs;
+              sessionFolder = candidateFolder;
+            }
+          } catch {}
+        }
+      } catch {
+        return null;
+      }
+    }
+
+    if (!sessionFolder) return null;
+
+    const fullTranscript = join(sessionFolder, ".system_generated", "logs", "transcript_full.jsonl");
+    const compactTranscript = join(sessionFolder, ".system_generated", "logs", "transcript.jsonl");
+    if (existsSync(fullTranscript)) return fullTranscript;
+    if (existsSync(compactTranscript)) return compactTranscript;
+    return null;
+  }
+
+  if (runner === "claude") {
+    const baseProjectsDir =
+      options.projectsDir ?? join(homedir(), ".claude", "projects");
+    if (!existsSync(baseProjectsDir)) return null;
+
+    if (options.cwd) {
+      const expectedSlug = toClaudeProjectSlug(options.cwd);
+      const candidateDir = join(baseProjectsDir, expectedSlug);
+      if (existsSync(candidateDir)) {
+        if (options.sessionId) {
+          const direct = join(candidateDir, `${options.sessionId}.jsonl`);
+          if (existsSync(direct)) return direct;
+        }
+        const newest = findNewestClaudeJsonl(candidateDir, options.sessionId);
+        if (newest) return newest;
+      }
+    }
+
+    try {
+      const dirs = readdirSync(baseProjectsDir, { withFileTypes: true });
+      let newestTime = 0;
+      let bestFile: string | null = null;
+      for (const d of dirs) {
+        if (!d.isDirectory()) continue;
+        const sub = join(baseProjectsDir, d.name);
+        const f = findNewestClaudeJsonl(sub, options.sessionId);
+        if (f) {
+          try {
+            const m = statSync(f).mtimeMs;
+            if (m > newestTime) {
+              newestTime = m;
+              bestFile = f;
+            }
+          } catch {}
+        }
+      }
+      return bestFile;
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
