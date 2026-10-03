@@ -2,6 +2,21 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [3.9.0] - 2026-10-03
+
+### Fixed
+- **Pi runner: kept-open subagents now deliver turn results automatically**:
+  - A `pi` subagent that parks at the end of a completed turn (`keepOpen: true`, `interactive: true`, or any non-auto-exit session) previously left the orchestrator widget showing `waiting` forever — its completion never arrived, and recovering the result required stopping the subagent and reading its session log. Herdr "idle" is never treated as completion for Pi (it can equally mean waiting on child subagents or an `ask_question` reply), so no parent-side completion signal existed.
+  - The child extension (`subagent-done.ts`) now writes a one-shot `${sessionFile}.parked` sidecar at a genuine turn end (nothing pending, turn not aborted), and the watcher (`pollForExit`) consumes it as turn completion for the Pi runner — mirroring how `agy`/`claude` kept-open sessions deliver per-turn results. Steering re-arms the per-turn watcher, so each follow-up message's result is delivered the same way.
+  - Freshness validation (`parkedAt`/`writtenAt` vs the current turn start) keeps steer↔result 1:1: a leftover signal from a previous turn can never be delivered as the current turn's result.
+  - The `agy`/`claude` idle-settle detection and the Pi idle-never-completes guard are unchanged; the parked-completion signal is added alongside them.
+
+### Changed
+- **`keepOpen` now suppresses the Pi child's auto-exit**: previously `keepOpen: true` on an auto-exit agent profile (worker/scout/researcher) still launched the child with `PI_SUBAGENT_AUTO_EXIT=1`, so the child shut down and left a dead pane and a stale widget entry. The child now auto-exits only when the session is not effectively interactive, matching how `agy`/`claude` keep their session alive under `keepOpen`.
+
+### Added
+- **Errored kept-open turns are reported**: a parked Pi session whose turn ends with `stopReason: "error"` (provider overload, retry exhausted) writes the existing `.exit` error sidecar, so the orchestrator receives a clear failure message instead of silence.
+
 ## [3.8.1] - 2026-09-30
 
 ### Fixed

@@ -63,6 +63,7 @@ subagent({ cli: "opencode", task: "Scan package dependencies" });
 | `name` | string | agent/runner | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
 | `model` | string | agent's model | Override the model for this spawn |
 | `cwd` | string | caller cwd | Working directory for the sub-agent |
+| `keepOpen` | boolean | `false` | Keep the pane open after the task completes. For the `pi` runner this also suppresses the child's auto-exit, so the session stays alive and steerable; each turn's result is still delivered automatically |
 
 ### Messaging
 
@@ -81,7 +82,7 @@ A Pi sub-agent can ask its orchestrator a single freeform question when requirem
 
 ## Supported CLI Runners
 
-- **`pi`**: The native Pi coding agent. Supports tool sandboxing, system prompt modes, auto-exit, and `ask_question`.
+- **`pi`**: The native Pi coding agent. Supports tool sandboxing, system prompt modes, auto-exit, and `ask_question`. Kept-open sessions (`keepOpen`) park after each turn and announce the turn end explicitly, so their result is delivered automatically while the pane stays steerable.
 - **`agy`**: Google Antigravity CLI. Runs in a dedicated Herdr pane with native lifecycle tracking.
 - **`claude`**: Anthropic Claude Code CLI. Runs with `--dangerously-skip-permissions`.
 - **`codex`**: OpenAI Codex CLI. Automatically integrates with Herdr's Windows bracketed-paste boundary handling.

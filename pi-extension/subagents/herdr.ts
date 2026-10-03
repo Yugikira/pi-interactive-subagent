@@ -851,6 +851,73 @@ export function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
+/**
+ * Whether a `.parked` signal counts for the current turn. Signals are
+ * accepted only when written at or after the current turn started, so a
+ * leftover from a previous turn can never be delivered as the current
+ * turn's result (steer↔result stay 1:1). The alternative — accepting any
+ * unconsumed signal — never drops a turn but lags one turn behind: every
+ * steer would deliver the *previous* turn's summary.
+ */
+export function isFreshParkSignal(parkedAt: number, turnStartTime: number): boolean {
+  return parkedAt >= turnStartTime;
+}
+
+/**
+ * Read-and-consume the `.exit` sidecar written by the Pi child extension
+ * (errored turn at auto-exit shutdown, or errored turn in a kept-open
+ * session). The file is deleted on consumption so it fires once. Stale
+ * signals (written before the current turn) and malformed payloads are
+ * dropped rather than delivered.
+ */
+export function consumeExitSidecar(sessionFile: string, turnStartTime: number): PollResult | null {
+  const exitFile = `${sessionFile}.exit`;
+  try {
+    if (!existsSync(exitFile)) return null;
+    const raw = readFileSync(exitFile, "utf-8");
+    rmSync(exitFile, { force: true });
+    let data: any;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return null; // malformed — consumed and dropped
+    }
+    // Legacy payloads without `writtenAt` stay accepted (pre-freshness behavior).
+    if (typeof data?.writtenAt === "number" && data.writtenAt < turnStartTime) return null;
+    return interpretExitSidecar(data);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read-and-consume the `.parked` sidecar written by the Pi child extension at
+ * a genuine turn end in a kept-open (non-auto-exit) session. This is the Pi
+ * runner's completion signal: Herdr "idle" is never trusted for Pi (it can
+ * equally mean waiting on child subagents or an ask_question reply), so the
+ * child announces the turn end explicitly instead. Consumed exactly once;
+ * stale signals are deleted and ignored.
+ */
+export function consumeParkedSidecar(sessionFile: string, turnStartTime: number): PollResult | null {
+  const parkFile = `${sessionFile}.parked`;
+  try {
+    if (!existsSync(parkFile)) return null;
+    const raw = readFileSync(parkFile, "utf-8");
+    rmSync(parkFile, { force: true });
+    let data: any;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return null; // malformed — consumed and dropped
+    }
+    const parkedAt = typeof data?.parkedAt === "number" ? data.parkedAt : 0;
+    if (!isFreshParkSignal(parkedAt, turnStartTime)) return null;
+    return { reason: "done", exitCode: 0 };
+  } catch {
+    return null;
+  }
+}
+
 export const __pollForExitTest__ = {
   interpretExitSidecar,
   setAgentStateOverride: (fn: ((target: string) => AgentInfo | null) | null) => {
@@ -871,6 +938,12 @@ export interface PollForExitOptions {
   agentName?: string;
   runner?: CanonicalRunner;
   cwd?: string;
+  /**
+   * Lower bound (ms epoch) for one-shot sidecar signals to count as fresh —
+   * the start of the current turn. Signals written before it are leftovers
+   * from an earlier turn and are dropped, keeping steer↔result 1:1.
+   */
+  turnStartTime?: number;
   idleSettleCount?: number;
   onTick?: (elapsed: number) => void;
 }
@@ -890,6 +963,22 @@ export async function pollForExit(
   let consecutiveNullCount = 0;
   const IDLE_SETTLE_COUNT = options.idleSettleCount ?? 3;
 
+  // One-shot sidecar signals written by the Pi child extension next to its
+  // session file: `.exit` (errored turn, any mode) and `.parked` (genuine
+  // turn end in a kept-open session — the Pi runner's completion signal,
+  // since Herdr "idle" is never trusted for Pi). Each is consumed at most
+  // once; stale leftovers are dropped.
+  const checkSidecars = (): PollResult | null => {
+    if (!options.sessionFile) return null;
+    const turnStartTime = options.turnStartTime ?? 0;
+    const exitResult = consumeExitSidecar(options.sessionFile, turnStartTime);
+    if (exitResult) return exitResult;
+    if (options.runner === "pi") {
+      return consumeParkedSidecar(options.sessionFile, turnStartTime);
+    }
+    return null;
+  };
+
   for (;;) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
@@ -904,17 +993,9 @@ export async function pollForExit(
       };
     }
 
-    // Fast path: check for .exit sidecar file (written by Pi's error path)
-    if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
-    }
+    // Fast path: one-shot sidecar signals (.exit / .parked)
+    const sidecarResult = checkSidecars();
+    if (sidecarResult) return sidecarResult;
 
     // Check sentinel file if specified (e.g. Claude stop hook)
     if (options.sentinelFile) {
@@ -940,6 +1021,9 @@ export async function pollForExit(
           // Pi subagents are autonomous processes that terminate via ctx.shutdown() when finished,
           // which shuts down the process / closes the pane. While Pi is running, "idle" simply means
           // it is waiting (e.g. for child subagents like scout/researcher, ask_question reply, or tool execution).
+          // A session that parks at a genuine turn end instead announces it explicitly via the
+          // `.parked` sidecar (consumed by checkSidecars above) — the only turn-level completion
+          // signal for Pi, so `runner !== "pi"` stays correct here.
           if (options.runner !== "pi") {
             let isActivelyWriting = false;
             if (options.runner === "agy" || options.runner === "claude") {
@@ -985,17 +1069,10 @@ export async function pollForExit(
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
-      // Transient error reading screen or pane is initializing
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
-      }
+      // Transient error reading screen or pane is initializing — sidecar
+      // signals may still be readable even when the screen isn't.
+      const sidecarResult = checkSidecars();
+      if (sidecarResult) return sidecarResult;
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);

@@ -1296,6 +1296,27 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("resolveChildAutoExit: interactive sessions suppress auto-exit; keepOpen wins over auto-exit frontmatter", () => {
+    // Autonomous default: auto-exit agents stay autonomous.
+    assert.equal(testApi.resolveChildAutoExit(true, false), true);
+    // keepOpen / interactive: true → the child must park after a turn so the
+    // pane stays steerable and its completions are delivered via .parked.
+    assert.equal(testApi.resolveChildAutoExit(true, true), false);
+    // No auto-exit frontmatter → never auto-exits, whatever the interactivity.
+    assert.equal(testApi.resolveChildAutoExit(false, false), false);
+    assert.equal(testApi.resolveChildAutoExit(undefined, false), false);
+    assert.equal(testApi.resolveChildAutoExit(undefined, true), false);
+    // End-to-end through the real resolution helpers: keepOpen on an
+    // auto-exit profile (scout/worker/researcher) suppresses child auto-exit.
+    const defs = { autoExit: true };
+    const interactive = testApi.resolveEffectiveInteractive(
+      { name: "A", task: "T", keepOpen: true },
+      defs,
+    );
+    assert.equal(interactive, true);
+    assert.equal(testApi.resolveChildAutoExit(defs.autoExit, interactive), false);
+  });
+
   it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
     for (const name of ["scout", "researcher", "worker"]) {
       const defs = testApi.loadAgentDefaults(name);
@@ -1623,6 +1644,49 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  // Shared harness: drives subagent-done.ts against a mock API whose handlers
+  // can be emitted directly (agent_start / input / agent_end) so session-park
+  // and auto-exit behavior is testable without a real agent loop.
+  function setupCapturingExtension(sessionFile: string, opts: { autoExit?: boolean } = {}) {
+    const autoExit = opts.autoExit ?? true;
+    const handlers = new Map<string, Array<(...args: any[]) => void>>();
+    const tools: any[] = [];
+    const api = {
+      on(event: string, handler: (...args: any[]) => void) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(handler);
+      },
+      registerTool(t: any) { tools.push(t); },
+      registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
+      sendUserMessage() {}, sendMessage() {}, getAllTools() { return []; },
+    } as any;
+    const saved = {
+      session: process.env.PI_SUBAGENT_SESSION,
+      name: process.env.PI_SUBAGENT_NAME,
+      agent: process.env.PI_SUBAGENT_AGENT,
+      autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+    };
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    process.env.PI_SUBAGENT_NAME = "scout-2";
+    process.env.PI_SUBAGENT_AGENT = "scout";
+    if (autoExit) process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+    else delete process.env.PI_SUBAGENT_AUTO_EXIT;
+    subagentDoneExtension(api);
+    const emit = (event: string, ...args: any[]) =>
+      (handlers.get(event) ?? []).forEach((h) => h(...args));
+    const restore = () => {
+      restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
+      restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
+      restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+    };
+    const ask = async () => {
+      const tool = tools.find((t) => t.name === "ask_question");
+      await tool.execute("c1", { question: "v1 or v2?" }, undefined, undefined, { shutdown() {} });
+    };
+    return { emit, ask, restore };
+  }
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -1800,44 +1864,6 @@ describe("subagent-done.ts", () => {
     // Regression tests for the mid-run reply race: a reply steered in while the
     // asking run is still open fires `input` but NOT `agent_start`, so the flag
     // must be cleared on `input` or the session parks forever.
-    function setupCapturingExtension(sessionFile: string) {
-      const handlers = new Map<string, Array<(...args: any[]) => void>>();
-      const tools: any[] = [];
-      const api = {
-        on(event: string, handler: (...args: any[]) => void) {
-          if (!handlers.has(event)) handlers.set(event, []);
-          handlers.get(event)!.push(handler);
-        },
-        registerTool(t: any) { tools.push(t); },
-        registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
-        sendUserMessage() {}, sendMessage() {}, getAllTools() { return []; },
-      } as any;
-      const saved = {
-        session: process.env.PI_SUBAGENT_SESSION,
-        name: process.env.PI_SUBAGENT_NAME,
-        agent: process.env.PI_SUBAGENT_AGENT,
-        autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
-      };
-      process.env.PI_SUBAGENT_SESSION = sessionFile;
-      process.env.PI_SUBAGENT_NAME = "scout-2";
-      process.env.PI_SUBAGENT_AGENT = "scout";
-      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
-      subagentDoneExtension(api);
-      const emit = (event: string, ...args: any[]) =>
-        (handlers.get(event) ?? []).forEach((h) => h(...args));
-      const restore = () => {
-        restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
-        restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
-        restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
-        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
-      };
-      const ask = async () => {
-        const tool = tools.find((t) => t.name === "ask_question");
-        await tool.execute("c1", { question: "v1 or v2?" }, undefined, undefined, { shutdown() {} });
-      };
-      return { emit, ask, restore };
-    }
-
     it("exits (does not park) when the reply arrives mid-run via input", async () => {
       const dir = createTestDir();
       const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
@@ -1886,6 +1912,129 @@ describe("subagent-done.ts", () => {
         let shutdown2 = false;
         emit("agent_end", { messages: [] }, { shutdown() { shutdown2 = true; } });
         assert.equal(shutdown2, true, "after the reply turn, agent_end should exit");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("parked completion signal (.parked)", () => {
+    const CHILDREN_KEY = Symbol.for("pi-subagents/running-children-count");
+
+    function emitAgentEnd(emit: (event: string, ...args: any[]) => void, messages: any[]) {
+      let shutdown = false;
+      emit("agent_end", { messages }, { shutdown() { shutdown = true; } });
+      return shutdown;
+    }
+
+    it("writes .parked (no shutdown) when a non-auto-exit session parks after a normal turn", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile, { autoExit: false });
+      try {
+        const shutdown = emitAgentEnd(emit, [{ role: "assistant", stopReason: "stop" }]);
+        assert.equal(shutdown, false, "non-auto-exit session must park, not shut down");
+
+        const parkedFile = `${sessionFile}.parked`;
+        assert.ok(existsSync(parkedFile), ".parked signal should be written at a genuine turn end");
+        const payload = JSON.parse(readFileSync(parkedFile, "utf-8"));
+        assert.equal(typeof payload.parkedAt, "number");
+        assert.equal(payload.name, "scout-2");
+        assert.equal(payload.agent, "scout");
+        assert.ok(!existsSync(`${sessionFile}.exit`), "clean completion must not write .exit");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not write .parked when the session auto-exits", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile, { autoExit: true });
+      try {
+        const shutdown = emitAgentEnd(emit, [{ role: "assistant", stopReason: "stop" }]);
+        assert.equal(shutdown, true, "auto-exit agent should shut down");
+        assert.ok(!existsSync(`${sessionFile}.parked`), "auto-exit path must not write .parked");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not write .parked while an ask_question reply is still pending", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile, { autoExit: false });
+      try {
+        emit("agent_start");
+        await ask();
+        const shutdown = emitAgentEnd(emit, [{ role: "assistant", stopReason: "stop" }]);
+        assert.equal(shutdown, false);
+        assert.ok(
+          !existsSync(`${sessionFile}.parked`),
+          "a pending question is the event; it must not also announce completion",
+        );
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not write .parked while child subagents are still running", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile, { autoExit: false });
+      const prev = (globalThis as any)[CHILDREN_KEY];
+      (globalThis as any)[CHILDREN_KEY] = () => 2;
+      try {
+        const shutdown = emitAgentEnd(emit, [{ role: "assistant", stopReason: "stop" }]);
+        assert.equal(shutdown, false);
+        assert.ok(
+          !existsSync(`${sessionFile}.parked`),
+          "an unfinished turn (children in flight) must not announce completion",
+        );
+      } finally {
+        (globalThis as any)[CHILDREN_KEY] = prev;
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not write .parked after an aborted turn", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile, { autoExit: false });
+      try {
+        const shutdown = emitAgentEnd(emit, [{ role: "assistant", stopReason: "aborted" }]);
+        assert.equal(shutdown, false, "aborted turns leave the session open for inspection");
+        assert.ok(!existsSync(`${sessionFile}.parked`), "aborted turn must not announce completion");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("writes the .exit error sidecar (with writtenAt) and no .parked when a parked turn errored", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile, { autoExit: false });
+      try {
+        const shutdown = emitAgentEnd(emit, [
+          { role: "assistant", stopReason: "error", errorMessage: "Anthropic 529 Overloaded" },
+        ]);
+        assert.equal(shutdown, false, "kept-open session parks even after an errored turn");
+        assert.ok(
+          !existsSync(`${sessionFile}.parked`),
+          "errored turns report via .exit, never as a clean completion",
+        );
+        const exitFile = `${sessionFile}.exit`;
+        assert.ok(existsSync(exitFile), "errored parked turn should write the .exit sidecar");
+        const payload = JSON.parse(readFileSync(exitFile, "utf-8"));
+        assert.equal(payload.type, "error");
+        assert.equal(payload.errorMessage, "Anthropic 529 Overloaded");
+        assert.equal(typeof payload.writtenAt, "number");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
@@ -4015,6 +4164,164 @@ describe("herdr.ts", () => {
         assert.equal(result.exitCode, 0);
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("pi runner consumes a fresh .parked sidecar as turn completion", async () => {
+      setSurfaceAliveOverride(() => true);
+      // Idle throughout — the sidecar alone must complete, idle must not.
+      setAgentStateOverride(() => ({ name: "pi-agent", state: "idle" }));
+
+      const dir = mkdtempSync(join(tmpdir(), "pi-parked-"));
+      try {
+        const sessionFile = join(dir, "s.jsonl");
+        writeFileSync(sessionFile, "");
+        const turnStartTime = Date.now() - 5_000;
+        writeFileSync(
+          `${sessionFile}.parked`,
+          JSON.stringify({ parkedAt: Date.now(), name: "worker", agent: "worker" }),
+        );
+
+        const ac = new AbortController();
+        const result = await pollForExit("dummy-surface", ac.signal, {
+          interval: 10,
+          agentName: "pi-agent",
+          runner: "pi",
+          sessionFile,
+          turnStartTime,
+        });
+
+        assert.equal(result.reason, "done");
+        assert.equal(result.exitCode, 0);
+        assert.ok(!existsSync(`${sessionFile}.parked`), "consumed .parked must be deleted");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("drops a stale .parked sidecar from a previous turn and keeps polling", async () => {
+      setSurfaceAliveOverride(() => true);
+      setAgentStateOverride(() => ({ name: "pi-agent", state: "working" }));
+
+      const dir = mkdtempSync(join(tmpdir(), "pi-parked-stale-"));
+      try {
+        const sessionFile = join(dir, "s.jsonl");
+        writeFileSync(sessionFile, "");
+        // Parked before the current turn started — a leftover, not this turn's result.
+        writeFileSync(`${sessionFile}.parked`, JSON.stringify({ parkedAt: Date.now() - 60_000 }));
+
+        const ac = new AbortController();
+        const pending = pollForExit("dummy-surface", ac.signal, {
+          interval: 10,
+          agentName: "pi-agent",
+          runner: "pi",
+          sessionFile,
+          turnStartTime: Date.now() - 1_000,
+        });
+        await new Promise((r) => setTimeout(r, 80));
+        assert.ok(!existsSync(`${sessionFile}.parked`), "stale .parked must be consumed and dropped");
+        ac.abort();
+        await assert.rejects(pending, /Aborted/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("consumes a fresh .exit error sidecar and reports the failure", async () => {
+      setSurfaceAliveOverride(() => true);
+      setAgentStateOverride(() => ({ name: "pi-agent", state: "working" }));
+
+      const dir = mkdtempSync(join(tmpdir(), "pi-exit-fresh-"));
+      try {
+        const sessionFile = join(dir, "s.jsonl");
+        writeFileSync(sessionFile, "");
+        writeFileSync(
+          `${sessionFile}.exit`,
+          JSON.stringify({
+            type: "error",
+            errorMessage: "Anthropic 529 Overloaded",
+            writtenAt: Date.now(),
+          }),
+        );
+
+        const ac = new AbortController();
+        const result = await pollForExit("dummy-surface", ac.signal, {
+          interval: 10,
+          agentName: "pi-agent",
+          runner: "pi",
+          sessionFile,
+          turnStartTime: Date.now() - 1_000,
+        });
+
+        assert.equal(result.reason, "error");
+        assert.equal(result.exitCode, 1);
+        assert.equal(result.errorMessage, "Anthropic 529 Overloaded");
+        assert.ok(!existsSync(`${sessionFile}.exit`), "consumed .exit must be deleted");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("ignores a stale .exit sidecar from a previous turn", async () => {
+      setSurfaceAliveOverride(() => true);
+      setAgentStateOverride(() => ({ name: "pi-agent", state: "working" }));
+
+      const dir = mkdtempSync(join(tmpdir(), "pi-exit-stale-"));
+      try {
+        const sessionFile = join(dir, "s.jsonl");
+        writeFileSync(sessionFile, "");
+        writeFileSync(
+          `${sessionFile}.exit`,
+          JSON.stringify({
+            type: "error",
+            errorMessage: "previous turn failure",
+            writtenAt: Date.now() - 60_000,
+          }),
+        );
+
+        const ac = new AbortController();
+        const pending = pollForExit("dummy-surface", ac.signal, {
+          interval: 10,
+          agentName: "pi-agent",
+          runner: "pi",
+          sessionFile,
+          turnStartTime: Date.now() - 1_000,
+        });
+        await new Promise((r) => setTimeout(r, 80));
+        assert.ok(!existsSync(`${sessionFile}.exit`), "stale .exit must be consumed and dropped");
+        ac.abort();
+        await assert.rejects(pending, /Aborted/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("accepts legacy .exit payloads without writtenAt (pre-freshness behavior)", async () => {
+      setSurfaceAliveOverride(() => true);
+      setAgentStateOverride(() => ({ name: "pi-agent", state: "working" }));
+
+      const dir = mkdtempSync(join(tmpdir(), "pi-exit-legacy-"));
+      try {
+        const sessionFile = join(dir, "s.jsonl");
+        writeFileSync(sessionFile, "");
+        writeFileSync(
+          `${sessionFile}.exit`,
+          JSON.stringify({ type: "error", errorMessage: "legacy payload" }),
+        );
+
+        const ac = new AbortController();
+        const result = await pollForExit("dummy-surface", ac.signal, {
+          interval: 10,
+          agentName: "pi-agent",
+          runner: "pi",
+          sessionFile,
+          turnStartTime: Date.now() - 1_000,
+        });
+
+        assert.equal(result.reason, "error");
+        assert.equal(result.errorMessage, "legacy payload");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
       }
     });
   });

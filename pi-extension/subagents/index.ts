@@ -442,6 +442,18 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
+/**
+ * Whether the Pi child process should auto-exit at the end of a completed
+ * turn. `auto-exit` frontmatter is the default, but an effectively
+ * interactive session (explicit `keepOpen` / `interactive: true`) overrides
+ * it: the session must stay alive to be steered, matching how the agy/claude
+ * CLIs keep their REPL open under `keepOpen`. A parked session's turn
+ * completions are delivered via the child's `.parked` sidecar.
+ */
+function resolveChildAutoExit(autoExit: boolean | undefined, interactive: boolean): boolean {
+  return (autoExit ?? false) && !interactive;
+}
+
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const configDir = getAgentConfigDir();
   const paths = [
@@ -1419,6 +1431,7 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  resolveChildAutoExit,
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
@@ -1641,10 +1654,16 @@ async function launchSubagent(
 
   const { inheritsConversationContext } = launchBehavior;
 
-  const modeHint = agentDefs?.autoExit
+  // Effective child auto-exit: interactive sessions (keepOpen / interactive
+  // frontmatter) stay parked after each turn instead of shutting down, so the
+  // session remains steerable; their turn completions are delivered via the
+  // `.parked` sidecar the child writes at agent_end.
+  const childAutoExit = resolveChildAutoExit(agentDefs?.autoExit, effectiveInteractive);
+
+  const modeHint = childAutoExit
     ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
     : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
-  const summaryInstruction = agentDefs?.autoExit
+  const summaryInstruction = childAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
   const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
@@ -1681,7 +1700,7 @@ async function launchSubagent(
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
     spawnable: agentDefs?.subagentAgents ?? null,
-    autoExit: agentDefs?.autoExit ?? false,
+    autoExit: childAutoExit,
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
   };
@@ -1723,7 +1742,7 @@ async function launchSubagent(
     if (grantSpawning && agentDefs?.subagentAgents) pwshEnvParts.push(`$env:PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))};`);
     pwshEnvParts.push(`$env:PI_SUBAGENT_NAME=${shellEscape(displayName)};`);
     if (agentName) pwshEnvParts.push(`$env:PI_SUBAGENT_AGENT=${shellEscape(agentName)};`);
-    if (agentDefs?.autoExit) pwshEnvParts.push(`$env:PI_SUBAGENT_AUTO_EXIT="1";`);
+    if (childAutoExit) pwshEnvParts.push(`$env:PI_SUBAGENT_AUTO_EXIT="1";`);
     pwshEnvParts.push(`$env:PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)};`);
     pwshEnvParts.push(`$env:PI_SUBAGENT_ID=${shellEscape(id)};`);
     pwshEnvParts.push(`$env:PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)};`);
@@ -1738,7 +1757,7 @@ async function launchSubagent(
     if (grantSpawning && agentDefs?.subagentAgents) envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
     envParts.push(`PI_SUBAGENT_NAME=${shellEscape(displayName)}`);
     if (agentName) envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(agentName)}`);
-    if (agentDefs?.autoExit) envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+    if (childAutoExit) envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
     envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
     envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
     envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
@@ -1884,6 +1903,9 @@ async function watchSubagent(
       agentName: herdrAgentName,
       runner: cli,
       cwd: running.cwd,
+      // Freshness bound for one-shot sidecar signals: a `.parked`/`.exit`
+      // written before this turn started is a leftover and gets dropped.
+      turnStartTime: running.turnStartTime ?? startTime,
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);

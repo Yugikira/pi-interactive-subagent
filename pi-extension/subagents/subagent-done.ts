@@ -11,6 +11,14 @@
  * signal the parent's watcher picks up, parks the session in a "waiting" state
  * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
  * replies with subagent_message — which lands as the subagent's next turn.
+ *
+ * When the session instead PARKS at the end of a completed turn (non-auto-exit
+ * / interactive sessions), it writes a one-shot `${sessionFile}.parked` signal
+ * so the parent's watcher can deliver that turn's result. This is the Pi
+ * runner's explicit completion announcement: Herdr "idle" is never treated as
+ * completion for Pi (it can equally mean waiting on child subagents or an
+ * ask_question reply), so the child — which alone knows nothing is pending —
+ * announces the turn end itself.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
@@ -101,6 +109,33 @@ export function findLatestAssistantError(
     };
   }
   return null;
+}
+
+/**
+ * Write the one-shot `.exit` sidecar the parent's watcher reads to report a
+ * failed run. Written both when an auto-exit agent shuts down after an
+ * errored turn and when a kept-open session parks after one. `writtenAt`
+ * lets the watcher drop stale signals left over from an earlier turn.
+ */
+export function writeErrorSidecar(
+  sessionFile: string | undefined,
+  errorInfo: SubagentErrorInfo | null,
+): void {
+  if (!errorInfo || !sessionFile) return;
+  try {
+    writeFileSync(
+      `${sessionFile}.exit`,
+      JSON.stringify({
+        type: "error",
+        errorMessage: errorInfo.errorMessage,
+        stopReason: errorInfo.stopReason,
+        writtenAt: Date.now(),
+      }),
+    );
+  } catch {
+    // Best effort — even without the sidecar, watcher's session-file
+    // fallback can still recover the errorMessage.
+  }
 }
 
 export function parseDeniedTools(rawValue: string | undefined): string[] {
@@ -233,11 +268,10 @@ export default function (pi: ExtensionAPI) {
     // In both cases the session parks as `waiting` and resumes when the next
     // turn lands.
     const hasPendingChildren = runningChildrenCount() > 0;
+    const turnCompleted = shouldAutoExitOnAgentEnd(userTookOver, messages);
     const shouldExit =
-      !awaitingAnswer &&
-      !hasPendingChildren &&
-      autoExit &&
-      shouldAutoExitOnAgentEnd(userTookOver, messages);
+      !awaitingAnswer && !hasPendingChildren && autoExit && turnCompleted;
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -245,27 +279,44 @@ export default function (pi: ExtensionAPI) {
       // can report a clear failure with the underlying error message.
       // Without this the parent would only see exit code 0 and a stale
       // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
-      }
+      writeErrorSidecar(sessionFile, findLatestAssistantError(messages));
 
       recorder.agentEndDone();
       ctx.shutdown();
       return;
+    }
+
+    // The session is staying open. If this turn genuinely finished (nothing
+    // pending, not aborted), announce it so the parent's watcher can deliver
+    // the result. Skipped while:
+    //  - awaitingAnswer: the question is the event; the `.ask` sidecar already
+    //    woke the parent and a completion here would duplicate it.
+    //  - hasPendingChildren: the turn is not finished; child results arrive as
+    //    steered turns and the final park will announce then.
+    //  - turnCompleted is false (stopReason "aborted"): Escape leaves the
+    //    session open for inspection without a spurious completion.
+    if (!awaitingAnswer && !hasPendingChildren && turnCompleted) {
+      const errorInfo = findLatestAssistantError(messages);
+      if (errorInfo) {
+        // Errored turn in a kept-open session: report the failure with the
+        // same payload auto-exit agents write at shutdown, and do NOT claim
+        // completion via `.parked`.
+        writeErrorSidecar(sessionFile, errorInfo);
+      } else if (sessionFile) {
+        try {
+          writeFileSync(
+            `${sessionFile}.parked`,
+            JSON.stringify({
+              parkedAt: Date.now(),
+              name: subagentName,
+              agent: subagentAgent,
+            }),
+          );
+        } catch {
+          // Best effort — without the sidecar the parent keeps waiting; the
+          // user can still steer or stop the subagent manually.
+        }
+      }
     }
 
     recorder.agentEndWaiting();
