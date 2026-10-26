@@ -8,10 +8,18 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { getNativeSessionFile } from "./session.ts";
+import { shellEscape } from "./shell.ts";
+import type { CanonicalRunner } from "./runner-kinds.ts";
+import {
+  consumeExitSignal,
+  consumeParkedSignal,
+  interpretExitSignal,
+  isFreshSignal,
+} from "./signals.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -24,6 +32,8 @@ export interface HerdrExecDeps {
   available(): boolean;
   /** Run herdr synchronously; throws on non-zero exit (herdr's error JSON is in the message). */
   run(args: string[], options?: { timeoutMs?: number }): string;
+  /** Async variant used by launch/monitor paths; falls back to execFile. */
+  runAsync?(args: string[], options?: { timeoutMs?: number }): Promise<string>;
 }
 
 const defaultHerdrDeps: HerdrExecDeps = {
@@ -34,6 +44,13 @@ const defaultHerdrDeps: HerdrExecDeps = {
       timeout: options?.timeoutMs ?? 60_000,
       stdio: ["pipe", "pipe", "pipe"],
     }),
+  runAsync: async (args, options) => {
+    const { stdout } = await execFileAsync(HERDR_BIN, args, {
+      encoding: "utf8",
+      timeout: options?.timeoutMs ?? 60_000,
+    });
+    return stdout;
+  },
 };
 
 let herdrDeps: HerdrExecDeps = defaultHerdrDeps;
@@ -76,43 +93,14 @@ export function logHerdr(message: string): void {
 }
 
 // ── Runner Kinds & Normalization ──
-
-export const RUNNER_KINDS = [
-  "pi",
-  "agy",
-  "claude",
-  "codex",
-  "grok",
-  "opencode",
-] as const;
-
-export type CanonicalRunner = (typeof RUNNER_KINDS)[number];
-
-const RUNNER_ALIASES: Record<string, CanonicalRunner> = {
-  pi: "pi",
-  agy: "agy",
-  antigravity: "agy",
-  "antigravity-cli": "agy",
-  claude: "claude",
-  "claude-code": "claude",
-  codex: "codex",
-  "openai-codex": "codex",
-  grok: "grok",
-  "grok-cli": "grok",
-  opencode: "opencode",
-  "open-code": "opencode",
-  open_code: "opencode",
-};
-
-export function normalizeRunner(input?: string | null): CanonicalRunner | undefined {
-  if (!input) return undefined;
-  const key = input.trim().toLowerCase();
-  return RUNNER_ALIASES[key];
-}
-
-export function isKnownRunner(input?: string | null): boolean {
-  return normalizeRunner(input) !== undefined;
-}
+// The taxonomy is a leaf module; re-exported here for the existing public API.
+export {
+  RUNNER_KINDS,
+  RUNNER_ALIASES,
+  normalizeRunner,
+  isKnownRunner,
+  type CanonicalRunner,
+} from "./runner-kinds.ts";
 
 // ── Availability ──
 
@@ -181,12 +169,7 @@ function requireHerdr(): void {
 
 // ── Shell Helpers ──
 
-export function shellEscape(s: string): string {
-  if (process.platform === "win32") {
-    return "'" + s.replace(/'/g, "''") + "'";
-  }
-  return "'" + s.replace(/'/g, "'\\''") + "'";
-}
+export { shellEscape } from "./shell.ts";
 
 /**
  * Herdr agent names must match `^[a-z][a-z0-9_-]{0,31}$` and be unique among live agents.
@@ -211,18 +194,119 @@ export function sanitizeAgentName(name: string): string {
 
 // ── Low-level Herdr CLI Execution ──
 
+/** A short, safe label for diagnostics (never includes task text or env). */
+function describeHerdrCommand(args: string[]): string {
+  return `herdr ${args.slice(0, 3).join(" ")}`;
+}
+
+function textFrom(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  return "";
+}
+
+/**
+ * Prefer the last embedded `{"error":…}` object. The prompt/task text can
+ * itself contain `"code"`/`"message"` keys; a plain regex over the whole
+ * "Command failed" blob could pick those up instead of Herdr's payload.
+ */
+function errorPayloadFrom(raw: string): { code: string; message: string } | null {
+  const marker = raw.lastIndexOf('{"error"');
+  if (marker >= 0) {
+    try {
+      const data = JSON.parse(raw.slice(marker));
+      if (data?.error) {
+        return {
+          code: data.error.code ?? "error",
+          message: data.error.message ?? JSON.stringify(data.error),
+        };
+      }
+    } catch {
+      // A truncated payload falls back to the regex parser.
+    }
+  }
+  return parseHerdrError(raw);
+}
+
+/**
+ * Herdr prints `{"error":{...}}` and exits non-zero for some failures, so the
+ * JSON arrives inside the thrown error's stdout rather than as a normal
+ * response. Surface the code/message instead of a 1 KB "Command failed" blob.
+ */
+function asHerdrFailure(error: unknown, args: string[]): Error {
+  const context = describeHerdrCommand(args);
+  // Check the child's own output first; the generic "Command failed" message
+  // repeats stderr and can also contain task text.
+  const sources = [
+    textFrom((error as any)?.stderr),
+    textFrom((error as any)?.stdout),
+    textFrom((error as any)?.message),
+  ];
+  for (const source of sources) {
+    if (!source) continue;
+    const parsed = errorPayloadFrom(source);
+    if (parsed) return new Error(`${context}: ${parsed.code}: ${parsed.message}`);
+  }
+  return error instanceof Error ? error : new Error(`${context}: ${String(error)}`);
+}
+
 function execHerdrSync(args: string[], options?: { timeout?: number }): string {
   requireHerdr();
-  return herdrDeps.run(args, { timeoutMs: options?.timeout });
+  const started = Date.now();
+  try {
+    const raw = herdrDeps.run(args, { timeoutMs: options?.timeout });
+    logHerdr(`${describeHerdrCommand(args)} ok ${Date.now() - started}ms`);
+    return raw;
+  } catch (err) {
+    const failure = asHerdrFailure(err, args);
+    logHerdr(`${describeHerdrCommand(args)} failed ${Date.now() - started}ms: ${failure.message}`);
+    throw failure;
+  }
 }
 
 async function execHerdrAsync(args: string[], options?: { timeout?: number }): Promise<string> {
   requireHerdr();
-  const { stdout } = await execFileAsync(HERDR_BIN, args, {
-    encoding: "utf8",
-    timeout: options?.timeout ?? 60_000,
-  });
-  return stdout;
+  const started = Date.now();
+  try {
+    const raw = herdrDeps.runAsync
+      ? await herdrDeps.runAsync(args, { timeoutMs: options?.timeout })
+      : (
+          await execFileAsync(HERDR_BIN, args, {
+            encoding: "utf8",
+            timeout: options?.timeout ?? 60_000,
+          })
+        ).stdout;
+    logHerdr(`${describeHerdrCommand(args)} ok ${Date.now() - started}ms`);
+    return raw;
+  } catch (err) {
+    const failure = asHerdrFailure(err, args);
+    logHerdr(`${describeHerdrCommand(args)} failed ${Date.now() - started}ms: ${failure.message}`);
+    throw failure;
+  }
+}
+
+/**
+ * Herdr's CLI prints `{"error":{...}}` on API failures but still exits 0.
+ * Parsing only on non-zero exit (or not parsing at all) silently treats a
+ * failed `agent start` as success. Callers that expect JSON use this helper.
+ *
+ * Non-JSON output (e.g. `pane read`) returns null rather than throwing.
+ */
+function parseHerdrResponse<T = any>(raw: string, context: string): T | null {
+  const trimmed = (raw ?? "").trim();
+  if (!trimmed) return null;
+  let data: any;
+  try {
+    data = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (data?.error) {
+    const code = data.error.code ?? "error";
+    const message = data.error.message ?? JSON.stringify(data.error);
+    throw new Error(`${context}: ${code}: ${message}`);
+  }
+  return data as T;
 }
 
 function parseHerdrJson<T = any>(raw: string): T {
@@ -235,27 +319,132 @@ function parseHerdrJson<T = any>(raw: string): T {
 
 // ── Surface / Pane Primitives ──
 
+export type SurfaceLayout = "right" | "down" | "tab";
+
 export interface CreateSurfaceOptions {
   direction?: "right" | "down";
+  /** `tab` creates a new Herdr tab; right/down split the source pane. */
+  layout?: SurfaceLayout;
   cwd?: string;
   env?: Record<string, string>;
   fromSurface?: string;
 }
 
-/**
- * Create a new sibling pane split for a subagent.
- * Defaults to splitting right off the current pane without stealing keyboard focus.
- * Returns the new pane id (e.g. `w1:p2`).
- */
-export function createSurface(name: string, options?: CreateSurfaceOptions): string {
-  void name;
-  requireHerdr();
+export interface PaneRect {
+  paneId: string;
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+}
 
-  const direction = options?.direction ?? "right";
+export interface TabLayout {
+  tabId: string;
+  panes: PaneRect[];
+}
+
+/** Parse `herdr pane layout` into per-pane rectangles. */
+export function parsePaneLayout(raw: string): TabLayout | null {
+  let data: any;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const layout = data?.result?.layout;
+  const panes = layout?.panes;
+  if (!Array.isArray(panes)) return null;
+  const parsed: PaneRect[] = [];
+  for (const pane of panes) {
+    const paneId = pane?.pane_id;
+    const rect = pane?.rect;
+    if (
+      typeof paneId !== "string" ||
+      typeof rect?.width !== "number" ||
+      typeof rect?.height !== "number"
+    ) {
+      continue;
+    }
+    parsed.push({
+      paneId,
+      width: rect.width,
+      height: rect.height,
+      x: typeof rect.x === "number" ? rect.x : 0,
+      y: typeof rect.y === "number" ? rect.y : 0,
+    });
+  }
+  return {
+    tabId: typeof layout?.tab_id === "string" ? layout.tab_id : "",
+    panes: parsed,
+  };
+}
+
+/** Geometry of the tab containing `surface` (or the caller's tab). */
+export function getTabLayout(surface?: string | null): TabLayout | null {
+  if (!herdrDeps.available()) return null;
+  try {
+    const args = ["pane", "layout", surface ? "--pane" : "--current"];
+    if (surface) args.push(surface);
+    return parsePaneLayout(execHerdrSync(args, { timeout: 5_000 }));
+  } catch {
+    return null;
+  }
+}
+
+/** Async layout read for the launch path. */
+export async function getTabLayoutAsync(surface?: string | null): Promise<TabLayout | null> {
+  if (!herdrDeps.available()) return null;
+  try {
+    const args = ["pane", "layout", surface ? "--pane" : "--current"];
+    if (surface) args.push(surface);
+    return parsePaneLayout(await execHerdrAsync(args, { timeout: 5_000 }));
+  } catch {
+    return null;
+  }
+}
+
+/** The pane this extension is running in, if Herdr exposes it. */
+export function currentPaneId(): string | null {
+  const fromEnv = process.env.HERDR_PANE_ID;
+  if (fromEnv) return fromEnv;
+  if (!herdrDeps.available()) return null;
+  try {
+    const data = parseHerdrJson(execHerdrSync(["pane", "current", "--current"], { timeout: 3_000 }));
+    const paneId = data?.result?.pane?.pane_id;
+    return typeof paneId === "string" ? paneId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A split is a UI operation on a server that answers other clients serially;
+ * 15 s leaves room for a busy Herdr without hanging the extension host forever.
+ */
+const SURFACE_CREATE_TIMEOUT_MS = 15_000;
+
+function buildTabArgs(options?: CreateSurfaceOptions): string[] {
+  const args = ["tab", "create", "--no-focus"];
+  if (options?.cwd) args.push("--cwd", options.cwd);
+  if (options?.env) {
+    for (const [key, value] of Object.entries(options.env)) {
+      args.push("--env", `${key}=${value}`);
+    }
+  }
+  return args;
+}
+
+function buildSplitArgs(options?: CreateSurfaceOptions): string[] {
+  const layout = options?.layout ?? options?.direction ?? "right";
+  const direction = layout === "down" ? "down" : "right";
   const args = ["pane", "split"];
 
-  if (options?.fromSurface) {
-    args.push("--pane", options.fromSurface);
+  // Anchor to the caller's pane rather than Herdr's "current" pane: closing a
+  // subagent shifts keyboard focus, and `--current` would then split an
+  // unrelated tab on the next spawn.
+  const fromSurface = options?.fromSurface ?? currentPaneId();
+  if (fromSurface) {
+    args.push("--pane", fromSurface);
   } else {
     args.push("--current");
   }
@@ -271,16 +460,80 @@ export function createSurface(name: string, options?: CreateSurfaceOptions): str
       args.push("--env", `${k}=${v}`);
     }
   }
+  return args;
+}
 
-  const raw = execHerdrSync(args);
-  const data = parseHerdrJson(raw);
+function parseSplitResponse(raw: string): string {
+  const data = parseHerdrResponse(raw, "herdr pane split");
   const paneId = data?.result?.pane?.pane_id ?? data?.pane?.pane_id ?? data?.pane_id;
-
-  if (typeof paneId !== "string" || !paneId) {
+  if (!data || typeof paneId !== "string" || !paneId) {
     throw new Error(`Unexpected herdr pane split response: ${raw}`);
   }
-
   return paneId;
+}
+
+function parseTabResponse(raw: string): string {
+  const data = parseHerdrResponse(raw, "herdr tab create");
+  const root = data?.result?.root_pane;
+  const paneId = typeof root?.pane_id === "string" ? root.pane_id : root;
+  if (!data || typeof paneId !== "string" || !paneId) {
+    throw new Error(`Unexpected herdr tab create response: ${raw}`);
+  }
+  return paneId;
+}
+
+/** Create a new tab and return its root pane id. */
+function createTabSurface(options?: CreateSurfaceOptions): string {
+  requireHerdr();
+  return parseTabResponse(
+    execHerdrSync(buildTabArgs(options), { timeout: SURFACE_CREATE_TIMEOUT_MS }),
+  );
+}
+
+async function createTabSurfaceAsync(options?: CreateSurfaceOptions): Promise<string> {
+  requireHerdr();
+  return parseTabResponse(
+    await execHerdrAsync(buildTabArgs(options), { timeout: SURFACE_CREATE_TIMEOUT_MS }),
+  );
+}
+
+/**
+ * Create a new sibling pane split for a subagent.
+ * Defaults to splitting right off the current pane without stealing keyboard focus.
+ * Returns the new pane id (e.g. `w1:p2`).
+ */
+export function createSurface(name: string, options?: CreateSurfaceOptions): string {
+  void name;
+  requireHerdr();
+
+  const layout = options?.layout ?? options?.direction ?? "right";
+  if (layout === "tab") return createTabSurface(options);
+
+  return parseSplitResponse(
+    execHerdrSync(buildSplitArgs(options), { timeout: SURFACE_CREATE_TIMEOUT_MS }),
+  );
+}
+
+/**
+ * Async surface creation for the launch path.
+ *
+ * The launch flow awaits this, so the TUI stays responsive and a slow/busy
+ * Herdr is bounded by an explicit timeout instead of blocking the event loop.
+ * `createSurface` remains for synchronous callers (resume fallbacks/tests).
+ */
+export async function createSurfaceAsync(
+  name: string,
+  options?: CreateSurfaceOptions,
+): Promise<string> {
+  void name;
+  requireHerdr();
+
+  const layout = options?.layout ?? options?.direction ?? "right";
+  if (layout === "tab") return createTabSurfaceAsync(options);
+
+  return parseSplitResponse(
+    await execHerdrAsync(buildSplitArgs(options), { timeout: SURFACE_CREATE_TIMEOUT_MS }),
+  );
 }
 
 /** Backward compatibility alias for createSurface. */
@@ -342,6 +595,19 @@ export function listPanes(onError?: (message: string) => void): PaneSummary[] | 
   }
 }
 
+/** Async pane inventory for the 1 Hz monitor; null means "cannot tell". */
+export async function listPanesAsync(
+  onError?: (message: string) => void,
+): Promise<PaneSummary[] | null> {
+  if (!herdrDeps.available()) return null;
+  try {
+    return parsePaneList(await execHerdrAsync(["pane", "list"], { timeout: 5_000 }));
+  } catch (err) {
+    onError?.(errorText(err));
+    return null;
+  }
+}
+
 /**
  * Tri-state pane existence: true / false / null ("cannot tell").
  *
@@ -351,6 +617,16 @@ export function listPanes(onError?: (message: string) => void): PaneSummary[] | 
  */
 export function paneExists(surface: string, onError?: (message: string) => void): boolean | null {
   const panes = listPanes(onError);
+  if (!panes) return null;
+  return panes.some((pane) => pane.paneId === surface);
+}
+
+/** Async tri-state pane existence for the completion/lifecycle path. */
+export async function paneExistsAsync(
+  surface: string,
+  onError?: (message: string) => void,
+): Promise<boolean | null> {
+  const panes = await listPanesAsync(onError);
   if (!panes) return null;
   return panes.some((pane) => pane.paneId === surface);
 }
@@ -389,7 +665,8 @@ export function closeSurface(surface: string, onError?: (message: string) => voi
 
 function tryClosePane(surface: string, onError?: (message: string) => void): boolean {
   try {
-    execHerdrSync(["pane", "close", surface], { timeout: 5_000 });
+    const raw = execHerdrSync(["pane", "close", surface], { timeout: 5_000 });
+    parseHerdrResponse(raw, `herdr pane close ${surface}`);
     return true;
   } catch (err) {
     // Reported rather than swallowed: "the close failed" is exactly the fact
@@ -444,20 +721,31 @@ export function terminateSurface(
 
   logHerdr(`terminate surface=${surface} closePane=${options?.closePane !== false}`);
 
-  const exists = paneExists(surface, onError);
-  logHerdr(`  paneExists=${exists}`);
-  // Only a *confirmed* absence short-circuits. "Cannot tell" falls through to
-  // the actual stop attempt.
-  if (exists === false) {
-    return { ...base, ok: true, paneClosed: true, method: "not-alive" };
+  const panes = listPanes(onError);
+  logHerdr(`  paneList=${panes === null ? "unreadable" : panes.length}`);
+  let knownAgent: string | undefined;
+  if (panes !== null) {
+    const pane = panes.find((candidate) => candidate.paneId === surface);
+    // Only a *confirmed* absence short-circuits. "Cannot tell" falls through
+    // to the actual stop attempt.
+    if (!pane) {
+      return { ...base, ok: true, paneClosed: true, method: "not-alive" };
+    }
+    knownAgent = pane.agent;
   }
 
-  // Ask the runner's TUI to exit: agent keys, falling back to the raw pane.
-  if (options?.agentName) {
+  // Address the agent by name only when the pane inventory confirms that agent
+  // is actually registered there. Otherwise Herdr logs `agent target not found`
+  // for every stop of an agent that died during startup, and the cascade hides
+  // the real failure.
+  const agentName = options?.agentName;
+  const canUseAgent =
+    !!agentName && (panes === null || knownAgent === agentName);
+  if (canUseAgent && agentName) {
     let agentError: string | null = null;
     try {
-      sendAgentKeys(options.agentName, ["ctrl+c", "ctrl+c"]);
-      attempted.push(`agent send-keys ${options.agentName} ctrl+c ctrl+c`);
+      sendAgentKeys(agentName, ["ctrl+c", "ctrl+c"]);
+      attempted.push(`agent send-keys ${agentName} ctrl+c ctrl+c`);
     } catch (err) {
       // Held back: if the pane fallback lands, the keys still arrived and this
       // is recoverable noise rather than a failure worth reporting.
@@ -466,7 +754,7 @@ export function terminateSurface(
 
     if (agentError !== null) {
       try {
-        execHerdrSync(["pane", "send-keys", surface, "ctrl+c", "ctrl+c"], { timeout: 3_000 });
+        sendPaneKeys(surface, ["ctrl+c", "ctrl+c"]);
         attempted.push(`pane send-keys ${surface} ctrl+c ctrl+c`);
       } catch (fallbackErr) {
         onError(`${agentError}; ${errorText(fallbackErr)}`);
@@ -474,7 +762,7 @@ export function terminateSurface(
     }
   } else {
     try {
-      execHerdrSync(["pane", "send-keys", surface, "ctrl+c", "ctrl+c"], { timeout: 3_000 });
+      sendPaneKeys(surface, ["ctrl+c", "ctrl+c"]);
       attempted.push(`pane send-keys ${surface} ctrl+c ctrl+c`);
     } catch (err) {
       onError(errorText(err));
@@ -504,22 +792,23 @@ export function terminateSurface(
 
 let surfaceAliveOverride: ((surface: string) => boolean) | null = null;
 
-/** Check whether a pane surface still exists in Herdr. */
+/**
+ * Check whether a pane surface still exists in Herdr.
+ *
+ * Only a confirmed absence returns false. A timed-out or unreadable inventory
+ * is treated as "still there": `pane read` is slower than the inventory, and
+ * treating its failure as death is what orphaned keepOpen panes.
+ */
 export function isSurfaceAlive(surface: string): boolean {
   if (surfaceAliveOverride) return surfaceAliveOverride(surface);
-  if (!isHerdrAvailable()) return false;
-  try {
-    execHerdrSync(["pane", "read", surface, "--lines", "1"], { timeout: 3_000 });
-    return true;
-  } catch {
-    return false;
-  }
+  return paneExists(surface) !== false;
 }
 
 /** Send raw command to run in a pane. */
 export function sendCommand(surface: string, command: string): void {
   requireHerdr();
-  execHerdrSync(["pane", "run", surface, command]);
+  const raw = execHerdrSync(["pane", "run", surface, command]);
+  parseHerdrResponse(raw, `herdr pane run ${surface}`);
 }
 
 /**
@@ -632,7 +921,8 @@ export function startAgent(
     args.push("--", ...options.args);
   }
 
-  execHerdrSync(args, { timeout: (options?.timeoutMs ?? 30_000) + 5_000 });
+  const raw = execHerdrSync(args, { timeout: (options?.timeoutMs ?? 30_000) + 5_000 });
+  parseHerdrResponse(raw, `herdr agent start ${safeName}`);
 }
 
 /**
@@ -656,7 +946,8 @@ export async function startAgentAsync(
     args.push("--", ...options.args);
   }
 
-  await execHerdrAsync(args, { timeout: (options?.timeoutMs ?? 30_000) + 5_000 });
+  const raw = await execHerdrAsync(args, { timeout: (options?.timeoutMs ?? 30_000) + 5_000 });
+  parseHerdrResponse(raw, `herdr agent start ${safeName}`);
 }
 
 /**
@@ -677,7 +968,8 @@ export function promptAgent(
     }
   }
 
-  execHerdrSync(args, { timeout: options?.timeoutMs });
+  const raw = execHerdrSync(args, { timeout: options?.timeoutMs });
+  parseHerdrResponse(raw, `herdr agent prompt ${target}`);
 }
 
 /**
@@ -697,7 +989,8 @@ export async function promptAgentAsync(
     }
   }
 
-  await execHerdrAsync(args, { timeout: options?.timeoutMs });
+  const raw = await execHerdrAsync(args, { timeout: options?.timeoutMs });
+  parseHerdrResponse(raw, `herdr agent prompt ${target}`);
 }
 
 export type HerdrAgentStateKind = "idle" | "working" | "blocked" | "done" | "unknown";
@@ -713,6 +1006,24 @@ export interface AgentInfo {
 
 let agentStateOverride: ((target: string) => AgentInfo | null) | null = null;
 
+function parseAgentInfo(data: any, target: string): AgentInfo | null {
+  const agent = data?.result?.agent ?? data?.agent ?? data?.result;
+  if (!agent) return null;
+  const rawState = (agent.agent_status ?? agent.state ?? agent.status ?? "unknown") as string;
+  const sessionVal =
+    agent.agent_session?.value ??
+    agent.agent_session_id ??
+    agent.agent_session?.id;
+  return {
+    name: agent.name ?? target,
+    kind: agent.agent ?? agent.kind,
+    state: rawState as HerdrAgentStateKind,
+    paneId: agent.pane_id,
+    sessionId: typeof sessionVal === "string" ? sessionVal : undefined,
+    raw: agent,
+  };
+}
+
 /**
  * Inspect the current state of an agent via `herdr agent get <target>`.
  */
@@ -721,22 +1032,19 @@ export function getAgentState(target: string): AgentInfo | null {
   if (!isHerdrAvailable()) return null;
   try {
     const raw = execHerdrSync(["agent", "get", target], { timeout: 3_000 });
-    const data = parseHerdrJson(raw);
-    const agent = data?.result?.agent ?? data?.agent ?? data?.result;
-    if (!agent) return null;
-    const rawState = (agent.agent_status ?? agent.state ?? agent.status ?? "unknown") as string;
-    const sessionVal =
-      agent.agent_session?.value ??
-      agent.agent_session_id ??
-      agent.agent_session?.id;
-    return {
-      name: agent.name ?? target,
-      kind: agent.agent ?? agent.kind,
-      state: rawState as HerdrAgentStateKind,
-      paneId: agent.pane_id,
-      sessionId: typeof sessionVal === "string" ? sessionVal : undefined,
-      raw: agent,
-    };
+    return parseAgentInfo(parseHerdrJson(raw), target);
+  } catch {
+    return null;
+  }
+}
+
+/** Async variant used by the 1 Hz monitor; never blocks the extension host. */
+export async function getAgentStateAsync(target: string): Promise<AgentInfo | null> {
+  if (agentStateOverride) return agentStateOverride(target);
+  if (!isHerdrAvailable()) return null;
+  try {
+    const raw = await execHerdrAsync(["agent", "get", target], { timeout: 3_000 });
+    return parseAgentInfo(parseHerdrJson(raw), target);
   } catch {
     return null;
   }
@@ -829,7 +1137,15 @@ export async function readAgentOutputAsync(target: string, lines = 1000): Promis
 /** Send key presses to an agent (e.g. esc, ctrl+c). */
 export function sendAgentKeys(target: string, keys: string[]): void {
   requireHerdr();
-  execHerdrSync(["agent", "send-keys", target, ...keys]);
+  const raw = execHerdrSync(["agent", "send-keys", target, ...keys]);
+  parseHerdrResponse(raw, `herdr agent send-keys ${target}`);
+}
+
+/** Send key presses straight to a pane (works while the agent is blocked). */
+export function sendPaneKeys(surface: string, keys: string[]): void {
+  requireHerdr();
+  const raw = execHerdrSync(["pane", "send-keys", surface, ...keys]);
+  parseHerdrResponse(raw, `herdr pane send-keys ${surface}`);
 }
 
 // ── Exit Polling ──
@@ -841,81 +1157,32 @@ export interface PollResult {
 }
 
 export function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "error") {
-    const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-        ? data.errorMessage
-        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
-  }
-  return { reason: "done", exitCode: 0 };
+  return interpretExitSignal(data);
 }
 
 /**
  * Whether a `.parked` signal counts for the current turn. Signals are
  * accepted only when written at or after the current turn started, so a
  * leftover from a previous turn can never be delivered as the current
- * turn's result (steer↔result stay 1:1). The alternative — accepting any
- * unconsumed signal — never drops a turn but lags one turn behind: every
- * steer would deliver the *previous* turn's summary.
+ * turn's result (steer↔result stay 1:1).
  */
 export function isFreshParkSignal(parkedAt: number, turnStartTime: number): boolean {
-  return parkedAt >= turnStartTime;
+  return isFreshSignal(parkedAt, turnStartTime);
 }
 
 /**
- * Read-and-consume the `.exit` sidecar written by the Pi child extension
- * (errored turn at auto-exit shutdown, or errored turn in a kept-open
- * session). The file is deleted on consumption so it fires once. Stale
- * signals (written before the current turn) and malformed payloads are
- * dropped rather than delivered.
+ * Read-and-consume the `.exit` signal. Kept as a thin alias while the legacy
+ * poller is still in place; the codec itself lives in `signals.ts`.
  */
 export function consumeExitSidecar(sessionFile: string, turnStartTime: number): PollResult | null {
-  const exitFile = `${sessionFile}.exit`;
-  try {
-    if (!existsSync(exitFile)) return null;
-    const raw = readFileSync(exitFile, "utf-8");
-    rmSync(exitFile, { force: true });
-    let data: any;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      return null; // malformed — consumed and dropped
-    }
-    // Legacy payloads without `writtenAt` stay accepted (pre-freshness behavior).
-    if (typeof data?.writtenAt === "number" && data.writtenAt < turnStartTime) return null;
-    return interpretExitSidecar(data);
-  } catch {
-    return null;
-  }
+  return consumeExitSignal(sessionFile, turnStartTime);
 }
 
 /**
- * Read-and-consume the `.parked` sidecar written by the Pi child extension at
- * a genuine turn end in a kept-open (non-auto-exit) session. This is the Pi
- * runner's completion signal: Herdr "idle" is never trusted for Pi (it can
- * equally mean waiting on child subagents or an ask_question reply), so the
- * child announces the turn end explicitly instead. Consumed exactly once;
- * stale signals are deleted and ignored.
+ * Read-and-consume the `.parked` signal for a kept-open Pi turn.
  */
 export function consumeParkedSidecar(sessionFile: string, turnStartTime: number): PollResult | null {
-  const parkFile = `${sessionFile}.parked`;
-  try {
-    if (!existsSync(parkFile)) return null;
-    const raw = readFileSync(parkFile, "utf-8");
-    rmSync(parkFile, { force: true });
-    let data: any;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      return null; // malformed — consumed and dropped
-    }
-    const parkedAt = typeof data?.parkedAt === "number" ? data.parkedAt : 0;
-    if (!isFreshParkSignal(parkedAt, turnStartTime)) return null;
-    return { reason: "done", exitCode: 0 };
-  } catch {
-    return null;
-  }
+  return consumeParkedSignal(sessionFile, turnStartTime);
 }
 
 export const __pollForExitTest__ = {

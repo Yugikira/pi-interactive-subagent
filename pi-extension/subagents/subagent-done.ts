@@ -23,8 +23,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { writeAskSignal, writeExitSignal, writeParkedSignal } from "./signals.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -123,37 +123,20 @@ export function writeErrorSidecar(
 ): void {
   if (!errorInfo || !sessionFile) return;
   try {
-    writeFileSync(
-      `${sessionFile}.exit`,
-      JSON.stringify({
-        type: "error",
-        errorMessage: errorInfo.errorMessage,
-        stopReason: errorInfo.stopReason,
-        writtenAt: Date.now(),
-      }),
-    );
+    writeExitSignal(sessionFile, errorInfo);
   } catch {
     // Best effort — even without the sidecar, watcher's session-file
     // fallback can still recover the errorMessage.
   }
 }
 
-export function parseDeniedTools(rawValue: string | undefined): string[] {
-  return (rawValue ?? "")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-}
-
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
-  let denied: string[] = [];
   let expanded = false;
 
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
-  const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
@@ -178,16 +161,8 @@ export default function (pi: ExtensionAPI) {
             .map((name: string) => theme.fg("dim", name))
             .join(theme.fg("muted", ", "));
 
-          let deniedLine = "";
-          if (denied.length > 0) {
-            const deniedList = denied
-              .map((name: string) => theme.fg("error", name))
-              .join(theme.fg("muted", ", "));
-            deniedLine = "\n" + theme.fg("muted", "denied: ") + deniedList;
-          }
-
           const content = new Text(
-            `${agentTag}${countInfo}${hint}\n${toolList}${deniedLine}`,
+            `${agentTag}${countInfo}${hint}\n${toolList}`,
             0,
             0,
           );
@@ -195,13 +170,9 @@ export default function (pi: ExtensionAPI) {
         } else {
           // Collapsed: one-line summary
           const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
-          const deniedInfo =
-            denied.length > 0
-              ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
-              : "";
           const hint = theme.fg("muted", "  (Ctrl+Alt+O to expand)");
 
-          const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
+          const content = new Text(`${agentTag}${countInfo}${hint}`, 0, 0);
           box.addChild(content);
         }
 
@@ -224,7 +195,6 @@ export default function (pi: ExtensionAPI) {
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
-    denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
   });
@@ -304,14 +274,7 @@ export default function (pi: ExtensionAPI) {
         writeErrorSidecar(sessionFile, errorInfo);
       } else if (sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.parked`,
-            JSON.stringify({
-              parkedAt: Date.now(),
-              name: subagentName,
-              agent: subagentAgent,
-            }),
-          );
+          writeParkedSignal(sessionFile, { name: subagentName, agent: subagentAgent });
         } catch {
           // Best effort — without the sidecar the parent keeps waiting; the
           // user can still steer or stop the subagent manually.
@@ -424,7 +387,7 @@ export default function (pi: ExtensionAPI) {
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
       };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+      writeAskSignal(sessionFile, askData);
 
       return {
         content: [

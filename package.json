@@ -1,6 +1,6 @@
 {
   "name": "interactive-subagents",
-  "version": "3.8.0",
+  "version": "3.10.8",
   "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in Herdr (pi, agy, claude, codex, grok, opencode)",
   "keywords": [
     "pi-package",
@@ -15,8 +15,10 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+    "test": "npm run test:unit",
+    "test:unit": "node --test test/test.ts test/signals.test.ts test/model-config.test.ts test/agents.test.ts test/config.test.ts test/runners.test.ts test/completion.test.ts test/status-stale.test.ts test/monitor.test.ts test/layout.test.ts test/system-prompt-mode.test.ts",
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -39,9 +41,14 @@
       "./pi-extension/subagents/index.ts"
     ]
   },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.87.1",
-    "@earendil-works/pi-tui": "^0.87.1",
-    "@sinclair/typebox": "^0.34.49"
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@earendil-works/pi-tui": "^1.4.0",
+    "@sinclair/typebox": "^0.34.52",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
   }
 }

@@ -1,5 +1,9 @@
 {
   "status": {
-    "enabled": true
+    "enabled": true,
+    "lineLimit": 4
+  },
+  "models": {
+    "agents": {}
   }
 }

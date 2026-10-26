@@ -8,13 +8,25 @@ import {
   readFileSync,
   readSync,
   readdirSync,
-  renameSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import {
+  loadoutPath,
+  nameRegistryPath as signalsNameRegistryPath,
+  readLoadout,
+  readNameRegistry as readNameRegistryFromDisk,
+  writeLoadout,
+  writeNameRegistry,
+  type NameRegistry,
+  type NameRegistryEntry,
+  type SubagentLoadout,
+} from "./signals.ts";
+
+export type { NameRegistry, NameRegistryEntry, SubagentLoadout } from "./signals.ts";
 
 export interface SessionEntry {
   type: string;
@@ -94,38 +106,15 @@ export function seedSubagentSessionFile(params: {
  * resume faithful even if the agent definition is later edited, moved, or
  * deleted.
  */
-export interface SubagentLoadout {
-  /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
-  agent: string | null;
-  /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
-  toolAllowlist: string | null;
-  /** Model id (without thinking suffix), or null to use the session default. */
-  model: string | null;
-  /** Thinking level appended to the model as `model:level`, or null. */
-  thinking: string | null;
-  /** How the identity text was applied: append/replace, or null. */
-  systemPromptMode: "append" | "replace" | null;
-  /** The system-prompt/identity text, only when it lived in the system prompt. */
-  identity: string | null;
-  /** Agents this subagent was allowed to spawn (for PI_SUBAGENT_ALLOWED). */
-  spawnable: string[] | null;
-  /** Whether the agent auto-exits (informational; resume forces autonomous). */
-  autoExit: boolean;
-  /** Working directory the subagent ran in, or null. */
-  cwd: string | null;
-  /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
-  agentDir: string | null;
-}
-
 /** Path of the loadout sidecar written next to a subagent session file. */
 export function loadoutSidecarPath(sessionFile: string): string {
-  return `${sessionFile}.loadout.json`;
+  return loadoutPath(sessionFile);
 }
 
 /** Persist a subagent's resolved sandbox loadout beside its session file. */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
   try {
-    writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
+    writeLoadout(sessionFile, loadout);
   } catch {
     // Best-effort: a missing snapshot only means resume will refuse, never that
     // it launches unrestricted.
@@ -134,15 +123,7 @@ export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoado
 
 /** Read a subagent's loadout snapshot, or null if absent/unparseable. */
 export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null {
-  try {
-    const p = loadoutSidecarPath(sessionFile);
-    if (!existsSync(p)) return null;
-    const parsed = JSON.parse(readFileSync(p, "utf8"));
-    if (!parsed || typeof parsed !== "object") return null;
-    return parsed as SubagentLoadout;
-  } catch {
-    return null;
-  }
+  return readLoadout(sessionFile);
 }
 
 // ── Name registry ────────────────────────────────────────────────────────────
@@ -154,31 +135,14 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
 // lives in the spawner's own artifact dir, which is directly addressable from
 // the spawner's session id (no sessions-tree scan, so resume stays fast).
 
-export interface NameRegistryEntry {
-  /** Absolute path to the subagent's session .jsonl file. */
-  sessionFile: string;
-  /** Canonical session header id (kept for display/lineage). */
-  sessionId: string | null;
-}
-
-export type NameRegistry = Record<string, NameRegistryEntry>;
-
 /** Path of the name registry for a given spawner session's artifact dir. */
 export function nameRegistryPath(artifactDir: string): string {
-  return join(artifactDir, "subagent-registry.json");
+  return signalsNameRegistryPath(artifactDir);
 }
 
 /** Read a spawner session's name registry, or {} if absent/corrupt. */
 export function readNameRegistry(artifactDir: string): NameRegistry {
-  try {
-    const p = nameRegistryPath(artifactDir);
-    if (!existsSync(p)) return {};
-    const parsed = JSON.parse(readFileSync(p, "utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return parsed as NameRegistry;
-  } catch {
-    return {};
-  }
+  return readNameRegistryFromDisk(artifactDir);
 }
 
 /**
@@ -192,13 +156,9 @@ export function registerName(
   entry: NameRegistryEntry,
 ): void {
   try {
-    mkdirSync(artifactDir, { recursive: true });
     const registry = readNameRegistry(artifactDir);
     registry[name] = entry;
-    const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
-    renameSync(tmp, p);
+    writeNameRegistry(artifactDir, registry);
   } catch {
     // Best-effort: a failed registration only means resume-by-name won't find
     // this subagent later; it never breaks the spawn itself.

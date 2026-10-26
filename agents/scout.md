@@ -2,7 +2,6 @@
 name: scout
 description: Fast codebase recon — explores files, finds patterns, maps architecture
 tools: read, grep, find, ls
-model: minimax-cn/MiniMax3.1-Flash-Preview
 thinking: low
 system-prompt: append
 auto-exit: true
