@@ -2,6 +2,22 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [3.10.3] - 2026-10-26
+
+### Fixed
+
+- **Herdr API errors are no longer mistaken for success.** The Herdr CLI prints
+  `{"error":{"code":…,"message":…}}` and still exits 0. `agent start`, `agent prompt`,
+  `agent send-keys`, pane split/close/run, and tab create now parse that payload and throw, so a
+  failed launch is reported instead of silently continuing.
+- **A failed non-Pi agent start is fatal.** The task is never typed into the pane's shell as a
+  fallback; the pane is closed and the clear Herdr error is returned. This is what produced the
+  runaway shell command (and the misleadingly "correct" pane) when Claude/Codex failed to start.
+- **Startup retries and a shorter bound.** `agent start` is retried once after a trust prompt or
+  a not-yet-ready pane, with an 8s readiness timeout per attempt (previously a 30s+ sync block).
+- **Stop uses the pane when the agent is not registered there**, avoiding `agent target not
+  found` noise after a child dies during startup.
+
 ## [3.10.2] - 2026-10-26
 
 ### Fixed

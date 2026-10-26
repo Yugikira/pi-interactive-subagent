@@ -23,7 +23,9 @@ import {
   readScreen,
   startAgentAsync,
   promptAgent,
+  promptAgentAsync,
   getAgentState,
+  getAgentStateAsync,
   readAgentOutput,
   readScreenAsync,
   listPanesAsync,
@@ -1146,7 +1148,48 @@ const trackedSurfaces = new Set<string>();
  * readiness wait is 30s; a child that exits on a bad model should not freeze
  * the extension host for that long.
  */
-const AGENT_START_TIMEOUT_MS = 15_000;
+const AGENT_START_TIMEOUT_MS = 8_000;
+const AGENT_START_ATTEMPTS = 2;
+
+/**
+ * Start an agent, retrying once for a pane whose shell is not ready yet.
+ * Accepts a trust prompt through the pane (the agent is not registered yet,
+ * so agent-targeted keys would be rejected). Throws the last Herdr error if
+ * every attempt fails; the caller must close the pane and report it.
+ */
+async function startAgentWithReadiness(
+  name: string,
+  kind: CanonicalRunner,
+  surface: string,
+  args: string[],
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < AGENT_START_ATTEMPTS; attempt++) {
+    try {
+      await startAgentAsync(name, kind, surface, {
+        args,
+        timeoutMs: AGENT_START_TIMEOUT_MS,
+      });
+      return;
+    } catch (err) {
+      lastError = err;
+      const screen = await readScreenAsync(surface, 20).catch(() => "");
+      if (/trust/i.test(screen)) {
+        try {
+          sendPaneKeys(surface, ["enter"]);
+        } catch {
+          // The pane may already be gone; the retry will report it.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 750));
+        continue;
+      }
+      if (attempt + 1 < AGENT_START_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, 750));
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
 
 /** Create the subagent pane according to `PI_SUBAGENT_LAYOUT`. */
 function createSubagentSurface(
@@ -1357,45 +1400,31 @@ async function launchSubagent(
   try {
     if (adapter.id === "pi") {
       try {
-        await startAgentAsync(herdrAgentName, "pi", surface, {
-          args: plan.startArgs,
-          timeoutMs: AGENT_START_TIMEOUT_MS,
-        });
+        await startAgentWithReadiness(herdrAgentName, "pi", surface, plan.startArgs);
       } catch {
+        // Last resort for Pi: run the shell command directly. If this also
+        // fails, the outer catch closes the pane and reports the error.
         sendLongCommand(surface, plan.fallbackCommand ?? "", {
           scriptPath: launchScriptFile!,
           scriptPreamble: (plan.scriptPreamble ?? []).join("\n"),
         });
       }
     } else {
-      try {
-        await startAgentAsync(herdrAgentName, adapter.id, surface, {
-          args: plan.startArgs,
-          timeoutMs: AGENT_START_TIMEOUT_MS,
-        });
-      } catch {
-        // Herdr returns agent_not_ready if the agent is blocked on startup
-        // (e.g. a workspace trust prompt). Accept it and retry the launch.
-        const screen = readScreen(surface, 20);
-        if (/trust.*folder|trust.*project/i.test(screen)) {
-          try {
-            sendAgentKeys(herdrAgentName, ["enter"]);
-          } catch {
-            sendCommand(surface, "");
-          }
-        }
-      }
+      // A failed agent start is fatal. Never type the task into the pane's
+      // shell: that is how a failed Claude/Codex spawn turned into a runaway
+      // shell command on Windows.
+      await startAgentWithReadiness(herdrAgentName, adapter.id, surface, plan.startArgs);
 
       for (let i = 0; i < 6; i++) {
-        const state = getAgentState(herdrAgentName);
+        const state = await getAgentStateAsync(herdrAgentName);
         if (state && (state.state === "idle" || state.state === "working")) break;
         if (state && state.state === "blocked") {
-          const screen = readScreen(surface, 15);
+          const screen = await readScreenAsync(surface, 15).catch(() => "");
           if (/trust/i.test(screen)) {
             try {
-              sendAgentKeys(herdrAgentName, ["enter"]);
+              sendPaneKeys(surface, ["enter"]);
             } catch {
-              sendCommand(surface, "");
+              // Retry below; the agent may still become ready.
             }
           }
         }
@@ -1404,19 +1433,16 @@ async function launchSubagent(
 
       const prompt = plan.prompt ?? params.task;
       try {
-        promptAgent(herdrAgentName, prompt);
-      } catch {
-        const screen = readScreen(surface, 15);
+        await promptAgentAsync(herdrAgentName, prompt);
+      } catch (promptError) {
+        // One trust-prompt retry, then fail. Never fall back to `pane run`.
+        const screen = await readScreenAsync(surface, 15).catch(() => "");
         if (/trust/i.test(screen)) {
-          try {
-            sendAgentKeys(herdrAgentName, ["enter"]);
-            await new Promise<void>((r) => setTimeout(r, 500));
-            promptAgent(herdrAgentName, prompt);
-          } catch {
-            sendCommand(surface, prompt);
-          }
+          sendPaneKeys(surface, ["enter"]);
+          await new Promise<void>((r) => setTimeout(r, 750));
+          await promptAgentAsync(herdrAgentName, prompt);
         } else {
-          sendCommand(surface, prompt);
+          throw promptError;
         }
       }
     }

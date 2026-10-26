@@ -58,6 +58,9 @@ import {
   parsePaneList,
   paneExists,
   parseHerdrError,
+  startAgent,
+  startAgentAsync,
+  promptAgent,
 } from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
@@ -4429,3 +4432,36 @@ describe("herdr.ts", () => {
   });
 });
 
+
+describe("herdr.ts CLI error payloads (exit 0)", () => {
+  const errorRun = () =>
+    JSON.stringify({ error: { code: "agent_pane_busy", message: "pane is not an available shell" } });
+
+  it("does not treat a failed agent start as success", async () => {
+    const restore = setHerdrExecDeps({ available: () => true, run: errorRun, runAsync: async () => errorRun() });
+    try {
+      assert.throws(
+        () => startAgent("scout", "claude", "w1:p1"),
+        /agent_pane_busy: pane is not an available shell/,
+      );
+      await assert.rejects(
+        startAgentAsync("scout", "claude", "w1:p1"),
+        /agent_pane_busy: pane is not an available shell/,
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("surfaces a failed prompt instead of typing it into the pane", () => {
+    const restore = setHerdrExecDeps({ available: () => true, run: errorRun });
+    try {
+      assert.throws(
+        () => promptAgent("scout", "search the news"),
+        /agent_pane_busy: pane is not an available shell/,
+      );
+    } finally {
+      restore();
+    }
+  });
+});

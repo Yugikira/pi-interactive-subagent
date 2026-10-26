@@ -211,6 +211,30 @@ async function execHerdrAsync(args: string[], options?: { timeout?: number }): P
   return stdout;
 }
 
+/**
+ * Herdr's CLI prints `{"error":{...}}` on API failures but still exits 0.
+ * Parsing only on non-zero exit (or not parsing at all) silently treats a
+ * failed `agent start` as success. Callers that expect JSON use this helper.
+ *
+ * Non-JSON output (e.g. `pane read`) returns null rather than throwing.
+ */
+function parseHerdrResponse<T = any>(raw: string, context: string): T | null {
+  const trimmed = (raw ?? "").trim();
+  if (!trimmed) return null;
+  let data: any;
+  try {
+    data = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (data?.error) {
+    const code = data.error.code ?? "error";
+    const message = data.error.message ?? JSON.stringify(data.error);
+    throw new Error(`${context}: ${code}: ${message}`);
+  }
+  return data as T;
+}
+
 function parseHerdrJson<T = any>(raw: string): T {
   try {
     return JSON.parse(raw) as T;
@@ -317,7 +341,7 @@ function createTabSurface(options?: CreateSurfaceOptions): string {
       args.push("--env", `${key}=${value}`);
     }
   }
-  const data = parseHerdrJson(execHerdrSync(args));
+  const data = parseHerdrResponse(execHerdrSync(args), "herdr tab create");
   const root = data?.result?.root_pane;
   const paneId = typeof root?.pane_id === "string" ? root.pane_id : root;
   if (typeof paneId !== "string" || !paneId) {
@@ -364,7 +388,7 @@ export function createSurface(name: string, options?: CreateSurfaceOptions): str
   }
 
   const raw = execHerdrSync(args);
-  const data = parseHerdrJson(raw);
+  const data = parseHerdrResponse(raw, "herdr pane split");
   const paneId = data?.result?.pane?.pane_id ?? data?.pane?.pane_id ?? data?.pane_id;
 
   if (typeof paneId !== "string" || !paneId) {
@@ -493,7 +517,8 @@ export function closeSurface(surface: string, onError?: (message: string) => voi
 
 function tryClosePane(surface: string, onError?: (message: string) => void): boolean {
   try {
-    execHerdrSync(["pane", "close", surface], { timeout: 5_000 });
+    const raw = execHerdrSync(["pane", "close", surface], { timeout: 5_000 });
+    parseHerdrResponse(raw, `herdr pane close ${surface}`);
     return true;
   } catch (err) {
     // Reported rather than swallowed: "the close failed" is exactly the fact
@@ -581,7 +606,7 @@ export function terminateSurface(
 
     if (agentError !== null) {
       try {
-        execHerdrSync(["pane", "send-keys", surface, "ctrl+c", "ctrl+c"], { timeout: 3_000 });
+        sendPaneKeys(surface, ["ctrl+c", "ctrl+c"]);
         attempted.push(`pane send-keys ${surface} ctrl+c ctrl+c`);
       } catch (fallbackErr) {
         onError(`${agentError}; ${errorText(fallbackErr)}`);
@@ -589,7 +614,7 @@ export function terminateSurface(
     }
   } else {
     try {
-      execHerdrSync(["pane", "send-keys", surface, "ctrl+c", "ctrl+c"], { timeout: 3_000 });
+      sendPaneKeys(surface, ["ctrl+c", "ctrl+c"]);
       attempted.push(`pane send-keys ${surface} ctrl+c ctrl+c`);
     } catch (err) {
       onError(errorText(err));
@@ -634,7 +659,8 @@ export function isSurfaceAlive(surface: string): boolean {
 /** Send raw command to run in a pane. */
 export function sendCommand(surface: string, command: string): void {
   requireHerdr();
-  execHerdrSync(["pane", "run", surface, command]);
+  const raw = execHerdrSync(["pane", "run", surface, command]);
+  parseHerdrResponse(raw, `herdr pane run ${surface}`);
 }
 
 /**
@@ -747,7 +773,8 @@ export function startAgent(
     args.push("--", ...options.args);
   }
 
-  execHerdrSync(args, { timeout: (options?.timeoutMs ?? 30_000) + 5_000 });
+  const raw = execHerdrSync(args, { timeout: (options?.timeoutMs ?? 30_000) + 5_000 });
+  parseHerdrResponse(raw, `herdr agent start ${safeName}`);
 }
 
 /**
@@ -771,7 +798,8 @@ export async function startAgentAsync(
     args.push("--", ...options.args);
   }
 
-  await execHerdrAsync(args, { timeout: (options?.timeoutMs ?? 30_000) + 5_000 });
+  const raw = await execHerdrAsync(args, { timeout: (options?.timeoutMs ?? 30_000) + 5_000 });
+  parseHerdrResponse(raw, `herdr agent start ${safeName}`);
 }
 
 /**
@@ -792,7 +820,8 @@ export function promptAgent(
     }
   }
 
-  execHerdrSync(args, { timeout: options?.timeoutMs });
+  const raw = execHerdrSync(args, { timeout: options?.timeoutMs });
+  parseHerdrResponse(raw, `herdr agent prompt ${target}`);
 }
 
 /**
@@ -812,7 +841,8 @@ export async function promptAgentAsync(
     }
   }
 
-  await execHerdrAsync(args, { timeout: options?.timeoutMs });
+  const raw = await execHerdrAsync(args, { timeout: options?.timeoutMs });
+  parseHerdrResponse(raw, `herdr agent prompt ${target}`);
 }
 
 export type HerdrAgentStateKind = "idle" | "working" | "blocked" | "done" | "unknown";
@@ -959,13 +989,15 @@ export async function readAgentOutputAsync(target: string, lines = 1000): Promis
 /** Send key presses to an agent (e.g. esc, ctrl+c). */
 export function sendAgentKeys(target: string, keys: string[]): void {
   requireHerdr();
-  execHerdrSync(["agent", "send-keys", target, ...keys]);
+  const raw = execHerdrSync(["agent", "send-keys", target, ...keys]);
+  parseHerdrResponse(raw, `herdr agent send-keys ${target}`);
 }
 
 /** Send key presses straight to a pane (works while the agent is blocked). */
 export function sendPaneKeys(surface: string, keys: string[]): void {
   requireHerdr();
-  execHerdrSync(["pane", "send-keys", surface, ...keys]);
+  const raw = execHerdrSync(["pane", "send-keys", surface, ...keys]);
+  parseHerdrResponse(raw, `herdr pane send-keys ${surface}`);
 }
 
 // ── Exit Polling ──
