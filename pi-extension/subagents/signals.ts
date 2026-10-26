@@ -89,6 +89,14 @@ export interface NameRegistryEntry {
   sessionId: string | null;
   /** Runner that produced the session (absent on legacy entries = pi). */
   runner?: string;
+  /**
+   * Last pane this subagent ran in. A completed keepOpen subagent stays
+   * discoverable by name so `subagent_stop` can close its leftover pane even
+   * after the in-memory running entry is gone (absent on legacy entries).
+   */
+  surface?: string;
+  /** Herdr agent name for the pane above (absent on legacy entries). */
+  herdrAgentName?: string;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;

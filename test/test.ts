@@ -3014,6 +3014,86 @@ describe("subagent interruption", () => {
     });
   });
 
+  describe("stop of a completed keepOpen subagent", () => {
+    it("closes the registered leftover pane by name", () => {
+      const testApi = (subagentsModule as any).__test__;
+      testApi.runningSubagents.clear();
+      const artifactDir = createTestDir();
+      registerName(artifactDir, "scout", {
+        sessionFile: join(artifactDir, "scout.jsonl"),
+        sessionId: "id-scout",
+        runner: "pi",
+        surface: "pane-9",
+        herdrAgentName: "scout",
+      });
+      const world = createFakeHerdr({ "pane-9": { agent: "scout" } }, {
+        agentNames: ["scout"],
+      });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const message = testApi.stopSubagentByName("scout", undefined, artifactDir);
+        assert.match(message, /Subagent "scout" stopped/);
+        assert.equal(world.panes.has("pane-9"), false);
+        assert.ok(
+          world.calls.some(
+            (call) => call[0] === "pane" && call[1] === "close" && call[2] === "pane-9",
+          ),
+        );
+      } finally {
+        restore();
+        rmSync(artifactDir, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses to close a pane that now belongs to another agent", () => {
+      const testApi = (subagentsModule as any).__test__;
+      testApi.runningSubagents.clear();
+      const artifactDir = createTestDir();
+      registerName(artifactDir, "scout", {
+        sessionFile: join(artifactDir, "scout.jsonl"),
+        sessionId: "id-scout",
+        runner: "pi",
+        surface: "pane-9",
+        herdrAgentName: "scout",
+      });
+      const world = createFakeHerdr({ "pane-9": { agent: "other-agent" } });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const message = testApi.stopSubagentByName("scout", undefined, artifactDir);
+        assert.match(message, /now belongs to "other-agent"/);
+        assert.equal(world.panes.has("pane-9"), true);
+      } finally {
+        restore();
+        rmSync(artifactDir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not claim a stop when the pane inventory is unreadable", () => {
+      const testApi = (subagentsModule as any).__test__;
+      testApi.runningSubagents.clear();
+      const artifactDir = createTestDir();
+      registerName(artifactDir, "scout", {
+        sessionFile: join(artifactDir, "scout.jsonl"),
+        sessionId: "id-scout",
+        runner: "pi",
+        surface: "pane-9",
+        herdrAgentName: "scout",
+      });
+      const world = createFakeHerdr({ "pane-9": { agent: "scout" } }, {
+        paneListFailsTimes: 1,
+      });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const message = testApi.stopSubagentByName("scout", undefined, artifactDir);
+        assert.match(message, /could not be verified/);
+        assert.equal(world.panes.has("pane-9"), true);
+      } finally {
+        restore();
+        rmSync(artifactDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("stop must not turn an unreadable probe into success", () => {
     it("keeps the exit keys when the pane inventory cannot be read", () => {
       // THE regression: a transient read failure was read as "the pane is gone",
@@ -4090,6 +4170,64 @@ describe("herdr.ts", () => {
         runningMap.clear();
       }
     });
+
+    it("closes a completed keepOpen pane through the name registry", async () => {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const testApi = (subagentsModule as any).__test__;
+      testApi.runningSubagents.clear();
+
+      const parentDir = createTestDir();
+      const sessionId = "parent-stop-tool";
+      const artifactDir = join(parentDir, "artifacts", sessionId);
+      registerName(artifactDir, "scout", {
+        sessionFile: join(artifactDir, "scout.jsonl"),
+        sessionId: "id-scout",
+        runner: "pi",
+        surface: "pane-9",
+        herdrAgentName: "scout",
+      });
+      const world = createFakeHerdr({ "pane-9": { agent: "scout" } }, {
+        agentNames: ["scout"],
+      });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const stopTool = registeredTools.find((t: any) => t.name === "subagent_stop");
+        assert.ok(stopTool);
+        const ctx = {
+          sessionManager: {
+            getSessionFile: () => join(parentDir, "parent.jsonl"),
+            getSessionId: () => sessionId,
+            getSessionDir: () => parentDir,
+          },
+        };
+        const res = await stopTool.execute(
+          "call-stop-registry",
+          { name: "scout", closePane: true },
+          undefined,
+          undefined,
+          ctx,
+        );
+        assert.equal(res.details?.stopped, true);
+        assert.equal(res.details?.name, "scout");
+        assert.equal(world.panes.has("pane-9"), false);
+      } finally {
+        restore();
+        rmSync(parentDir, { recursive: true, force: true });
+        testApi.runningSubagents.clear();
+      }
+    });
+  });
+
+  describe("parent model inheritance", () => {
+    it("inherits the parent model only for the Pi runner", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const parent = { provider: "minimax-cn", id: "MiniMax-3.1-Flash" };
+      assert.equal(testApi.parentModelForRunner("pi", parent), "minimax-cn/MiniMax-3.1-Flash");
+      for (const runner of ["agy", "claude", "codex", "grok", "opencode"]) {
+        assert.equal(testApi.parentModelForRunner(runner, parent), null);
+      }
+    });
   });
 
   describe("getNativeSessionFile", () => {
@@ -4459,6 +4597,39 @@ describe("herdr.ts CLI error payloads (exit 0)", () => {
       assert.throws(
         () => promptAgent("scout", "search the news"),
         /agent_pane_busy: pane is not an available shell/,
+      );
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("herdr.ts CLI error payloads (non-zero exit)", () => {
+  const payload =
+    '{"error":{"code":"invalid_agent_argument","message":"agent arguments cannot be encoded safely for the target shell"}}';
+  const failure = () =>
+    Object.assign(new Error('Command failed: herdr.exe agent start scout "code" "fake"'), {
+      stderr: `${payload}\n`,
+    });
+
+  it("surfaces the code and message from the child's stderr", async () => {
+    const restore = setHerdrExecDeps({
+      available: () => true,
+      run: () => {
+        throw failure();
+      },
+      runAsync: async () => {
+        throw failure();
+      },
+    });
+    try {
+      assert.throws(
+        () => startAgent("scout", "claude", "w1:p1"),
+        /herdr agent start scout: invalid_agent_argument: agent arguments cannot be encoded safely/,
+      );
+      await assert.rejects(
+        () => startAgentAsync("scout", "claude", "w1:p1"),
+        /herdr agent start scout: invalid_agent_argument: agent arguments cannot be encoded safely/,
       );
     } finally {
       restore();

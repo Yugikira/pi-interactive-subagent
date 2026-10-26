@@ -2,6 +2,43 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [3.10.4] - 2026-10-27
+
+### Fixed
+
+- **A completed `keepOpen` subagent can still be stopped.** Completion cleanup called
+  `isSurfaceAlive` — a 3 s `pane read` — and deleted the running entry when that probe failed.
+  On a busy Herdr the read times out, so the entry vanished while the pane stayed open and
+  `subagent_stop({ name })` reported "No subagents are currently running". Interactive entries are
+  now only discarded when `paneExistsAsync` **confirms** the pane is gone; an unreadable inventory
+  keeps the handle. `subagent_stop` falls back to the session's persistent name registry (now
+  recording `surface` and `herdrAgentName`), closes the leftover pane, refuses a pane that now
+  belongs to another agent, and reports unverifiable inventories as failures.
+- **Claude agent identities no longer break `herdr agent start`.** The Claude adapter passed the
+  multi-line agent body as one `--append-system-prompt` argument; Herdr rejects multi-line argv
+  (`invalid_agent_argument: agent arguments cannot be encoded safely for the target shell`). The
+  body is written to `context/claude-sysprompt-<id>.md` and passed with
+  `--append-system-prompt-file`.
+- **Parent model inheritance is Pi-only.** A `ctx.model` value such as
+  `minimax-cn/MiniMax-3.1-Flash` was passed to Claude/Codex/Grok/etc., which cannot resolve it.
+  `subagents_list` also stops advertising the parent model for non-Pi agents.
+- **Herdr's real failure is reported.** Non-zero exits carry the `{"error":…}` payload in
+  stdout/stderr; the extension now parses it instead of surfacing a raw `Command failed` blob.
+  Empty stdout is still accepted where Herdr legitimately returns none (`pane run`, send-keys,
+  `agent start`), and the agent start is verified through `agent get`/`pane list` instead.
+- **Launch surface creation is async, bounded, and cleaned up.** `createSurfaceAsync`,
+  `createTabSurfaceAsync`, and `getTabLayoutAsync` keep the event loop responsive; surface
+  creation now runs inside the launch `try` so a failure after the pane exists closes it instead
+  of leaking an orphan.
+- **A readiness timeout no longer starts the agent twice or types the launch into a live agent.**
+  `startAgentWithReadiness` checks registration before retrying, trusts a successful start when the
+  inventory is unreadable, accepts a failed start only with confirmed registration, and does not
+  retry deterministic argument errors.
+- Resume now updates the registry entry with the resumed pane, so a later stop-by-name targets the
+  current pane rather than the original one.
+- The bundled `researcher` profile describes the role runner-neutrally instead of naming
+  Antigravity.
+
 ## [3.10.3] - 2026-10-26
 
 ### Fixed

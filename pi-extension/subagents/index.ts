@@ -15,11 +15,12 @@ import {
   isHerdrAvailable,
   isMuxAvailable,
   muxSetupHint,
-  createSurface,
+  createSurfaceAsync,
   sendCommand,
   sendLongCommand,
   terminateSurface,
-  isSurfaceAlive,
+  paneExistsAsync,
+  listPanes,
   readScreen,
   startAgentAsync,
   promptAgent,
@@ -32,7 +33,7 @@ import {
   sendAgentKeys,
   sendPaneKeys,
   currentPaneId,
-  getTabLayout,
+  getTabLayoutAsync,
   sanitizeAgentName,
   sanitizeTerminalOutput,
   setHerdrLogSink,
@@ -276,6 +277,17 @@ function resolveEffectiveInteractive(
  */
 function resolveChildAutoExit(autoExit: boolean | undefined, interactive: boolean): boolean {
   return (autoExit ?? false) && !interactive;
+}
+
+/**
+ * Only a Pi child can inherit the parent's active model: `ctx.model` is a Pi
+ * catalog id (`provider/id`), which the other CLIs do not understand.
+ */
+function parentModelForRunner(
+  runner: CanonicalRunner,
+  parentModel: { provider?: string; id?: string } | null | undefined,
+): string | null {
+  return runner === "pi" ? formatParentModel(parentModel) : null;
 }
 
 function resolveRunnerAndAgent(params: {
@@ -1033,7 +1045,98 @@ function formatStopMessage(name: string, outcome: TerminateOutcome): string {
   );
 }
 
-function stopSubagentByName(targetName?: string, parentSessionId?: string): string {
+/**
+ * Stop a subagent that has already completed but whose keepOpen pane still
+ * exists. The running entry is gone by then, so the persistent name registry
+ * is the only handle left. Never closes a pane that now belongs to another
+ * agent, and never claims success when Herdr cannot verify the inventory.
+ */
+function stopCompletedByName(
+  name: string,
+  artifactDir: string | null | undefined,
+  closePane: boolean,
+): { handled: boolean; message: string; details?: Record<string, unknown> } {
+  if (!artifactDir) return { handled: false, message: "" };
+  const registry = readNameRegistry(artifactDir);
+  const key = Object.keys(registry).find(
+    (candidate) => candidate.toLowerCase() === name.toLowerCase(),
+  );
+  if (!key) return { handled: false, message: "" };
+  const entry = registry[key];
+  const displayName = key;
+
+  if (!entry.surface) {
+    return {
+      handled: true,
+      message:
+        `Subagent "${displayName}" has already finished; there is no running pane to stop.` +
+        (entry.sessionFile ? ` Its session is ${entry.sessionFile}.` : ""),
+      details: { stopped: false, reason: "already_finished", name: displayName },
+    };
+  }
+
+  const panes = listPanes();
+  if (panes === null) {
+    return {
+      handled: true,
+      message:
+        `Subagent "${displayName}" is not in the running list, and Herdr could not report ` +
+        `the state of pane ${entry.surface}; the stop could not be verified.`,
+      details: { stopped: false, reason: "unverified", name: displayName },
+    };
+  }
+
+  const pane = panes.find((candidate) => candidate.paneId === entry.surface);
+  if (!pane) {
+    return {
+      handled: true,
+      message: `Subagent "${displayName}" had already exited; pane ${entry.surface} is gone.`,
+      details: { stopped: false, reason: "pane_gone", name: displayName },
+    };
+  }
+  if (pane.agent && entry.herdrAgentName && pane.agent !== entry.herdrAgentName) {
+    return {
+      handled: true,
+      message:
+        `Subagent "${displayName}" had finished, but pane ${entry.surface} now belongs to ` +
+        `"${pane.agent}"; it was left alone.`,
+      details: { stopped: false, reason: "pane_reused", name: displayName },
+    };
+  }
+
+  const outcome = terminateSurface(entry.surface, {
+    agentName: entry.herdrAgentName,
+    closePane,
+  });
+  const stopped = outcome.ok || outcome.paneClosed;
+  return {
+    handled: true,
+    message: formatStopMessage(displayName, outcome),
+    details: {
+      stopped,
+      name: displayName,
+      paneClosed: outcome.paneClosed,
+      reason: "registry",
+      ...(stopped ? {} : { warning: formatStopMessage(displayName, outcome) }),
+    },
+  };
+}
+
+/** The caller session's artifact directory (name registry), when available. */
+function artifactDirForContext(ctx: any): string | null {
+  try {
+    if (!ctx?.sessionManager?.getSessionFile?.()) return null;
+    return getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+  } catch {
+    return null;
+  }
+}
+
+function stopSubagentByName(
+  targetName?: string,
+  parentSessionId?: string,
+  artifactDir?: string | null,
+): string {
   const visible = () =>
     Array.from(runningSubagents.values()).filter(
       (running) =>
@@ -1070,6 +1173,8 @@ function stopSubagentByName(targetName?: string, parentSessionId?: string): stri
   if (trimmed) {
     const match = visible().find((r) => r.name.toLowerCase() === trimmed.toLowerCase());
     if (!match) {
+      const fallback = stopCompletedByName(trimmed, artifactDir, true);
+      if (fallback.handled) return fallback.message;
       const names = visible().map((r) => r.name);
       return `No running subagent named "${trimmed}". Currently running: ${names.join(", ") || "none"}.`;
     }
@@ -1102,6 +1207,7 @@ export const __test__ = {
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveRunnerAndAgent,
+  parentModelForRunner,
   normalizeRunner,
   isKnownRunner,
   RUNNER_KINDS,
@@ -1127,6 +1233,7 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   runningSubagents,
   stopSubagentByName,
+  stopCompletedByName,
   terminateRunning,
   formatStopMessage,
   terminateSurface,
@@ -1152,10 +1259,30 @@ const AGENT_START_TIMEOUT_MS = 8_000;
 const AGENT_START_ATTEMPTS = 2;
 
 /**
+ * Is the named agent registered in the pane we started?
+ * `null` means Herdr could not tell (both the agent lookup and the pane
+ * inventory failed), which must not be mistaken for a confirmed miss.
+ */
+async function agentRegistrationState(
+  name: string,
+  surface: string,
+): Promise<boolean | null> {
+  const info = await getAgentStateAsync(name).catch(() => null);
+  if (info) return !info.paneId || info.paneId === surface;
+  const panes = await listPanesAsync().catch(() => null);
+  if (panes === null) return null;
+  return panes.some((pane) => pane.paneId === surface && pane.agent === name);
+}
+
+/**
  * Start an agent, retrying once for a pane whose shell is not ready yet.
  * Accepts a trust prompt through the pane (the agent is not registered yet,
- * so agent-targeted keys would be rejected). Throws the last Herdr error if
- * every attempt fails; the caller must close the pane and report it.
+ * so agent-targeted keys would be rejected).
+ *
+ * Herdr's `agent start --timeout` bounds its readiness wait; the child may
+ * still come up just after that timeout. Treat a registered agent as success
+ * before retrying, otherwise a duplicate start/fallback types the launch
+ * command into a live agent.
  */
 async function startAgentWithReadiness(
   name: string,
@@ -1165,44 +1292,66 @@ async function startAgentWithReadiness(
 ): Promise<void> {
   let lastError: unknown;
   for (let attempt = 0; attempt < AGENT_START_ATTEMPTS; attempt++) {
+    let startError: unknown = null;
     try {
       await startAgentAsync(name, kind, surface, {
         args,
         timeoutMs: AGENT_START_TIMEOUT_MS,
       });
-      return;
     } catch (err) {
-      lastError = err;
-      const screen = await readScreenAsync(surface, 20).catch(() => "");
-      if (/trust/i.test(screen)) {
-        try {
-          sendPaneKeys(surface, ["enter"]);
-        } catch {
-          // The pane may already be gone; the retry will report it.
-        }
-        await new Promise((resolve) => setTimeout(resolve, 750));
-        continue;
+      startError = err;
+    }
+
+    // Herdr may report a readiness timeout (or an empty response) after the
+    // agent has already come up. Registration is the ground truth, but an
+    // unreadable inventory is not a miss: a start command that reported success
+    // is trusted through an unknown inventory, and a failed one is only
+    // treated as success when registration is confirmed.
+    const registration = await agentRegistrationState(name, surface);
+    if (startError) {
+      if (registration === true) return;
+      lastError = startError;
+      const message = startError instanceof Error ? startError.message : String(startError);
+      // Argument/shape errors are deterministic; retrying cannot fix them.
+      if (/invalid_agent_argument|unknown option|invalid .*argument/i.test(message)) {
+        throw startError;
       }
-      if (attempt + 1 < AGENT_START_ATTEMPTS) {
-        await new Promise((resolve) => setTimeout(resolve, 750));
+    } else {
+      if (registration !== false) return;
+      lastError = new Error(
+        `herdr agent start ${name}: agent was not registered in pane ${surface}`,
+      );
+    }
+
+    const screen = await readScreenAsync(surface, 20).catch(() => "");
+    if (/trust/i.test(screen)) {
+      try {
+        sendPaneKeys(surface, ["enter"]);
+      } catch {
+        // The pane may already be gone; the retry will report it.
       }
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      continue;
+    }
+    if (attempt + 1 < AGENT_START_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, 750));
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 /** Create the subagent pane according to `PI_SUBAGENT_LAYOUT`. */
-function createSubagentSurface(
+async function createSubagentSurface(
   displayName: string,
   cwd: string,
   env: Record<string, string>,
-): string {
+): Promise<string> {
   const mode = resolveSubagentLayout();
   if (mode === "tab") {
-    return createSurface(displayName, { cwd, env, layout: "tab" });
+    return createSurfaceAsync(displayName, { cwd, env, layout: "tab" });
   }
   if (mode === "down") {
-    return createSurface(displayName, {
+    return createSurfaceAsync(displayName, {
       cwd,
       env,
       layout: "down",
@@ -1211,14 +1360,14 @@ function createSubagentSurface(
   }
   if (mode === "smart") {
     const caller = currentPaneId();
-    const layout = getTabLayout(caller);
+    const layout = await getTabLayoutAsync(caller);
     const panes = layout?.panes ?? [];
     // Drop panes that no longer exist so a stale id cannot become the target.
     for (const id of [...trackedSurfaces]) {
       if (!panes.some((pane) => pane.paneId === id)) trackedSurfaces.delete(id);
     }
     const choice = chooseSplitTarget(caller, panes, trackedSurfaces);
-    const surface = createSurface(displayName, {
+    const surface = await createSurfaceAsync(displayName, {
       cwd,
       env,
       layout: choice.direction,
@@ -1228,7 +1377,7 @@ function createSubagentSurface(
     return surface;
   }
   // Default: preserve the historical right split, anchored to the caller.
-  return createSurface(displayName, {
+  return createSurfaceAsync(displayName, {
     cwd,
     env,
     layout: "right",
@@ -1264,7 +1413,7 @@ async function launchSubagent(
     agentModel: agentDefs?.model,
     config: getSubagentConfig().models,
     env: process.env,
-    parentModel: formatParentModel(ctx.model),
+    parentModel: parentModelForRunner(adapter.id, ctx.model) ?? undefined,
   }).model ?? undefined;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
@@ -1379,11 +1528,7 @@ async function launchSubagent(
   // pane env. Every runner now gets the same env, including the spawn
   // allowlist and agent dir on the normal startAgent path.
   const surfacePreCreated = !!options?.surface;
-  const surface =
-    options?.surface ?? createSubagentSurface(displayName, targetCwdForSession, plan.env);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
+  let surface = "";
 
   const ext = process.platform === "win32" ? "ps1" : "sh";
   const safeName = displayName
@@ -1398,6 +1543,14 @@ async function launchSubagent(
       : undefined;
 
   try {
+    // Surface creation lives inside the launch try so a failure after the pane
+    // exists still cleans it up instead of leaking an orphan.
+    surface =
+      options?.surface ?? (await createSubagentSurface(displayName, targetCwdForSession, plan.env));
+    if (!surfacePreCreated) {
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
+
     if (adapter.id === "pi") {
       try {
         await startAgentWithReadiness(herdrAgentName, "pi", surface, plan.startArgs);
@@ -1476,7 +1629,7 @@ async function launchSubagent(
     runningSubagents.set(id, running);
     return running;
   } catch (err) {
-    if (!surfacePreCreated) {
+    if (surface && !surfacePreCreated) {
       terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
     }
     throw err;
@@ -1622,12 +1775,19 @@ async function watchSubagent(
         await new Promise((r) => setTimeout(r, 500));
         terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
       }
-      if (!running.interactive || !isSurfaceAlive(surface)) {
+      if (!running.interactive) {
         runningSubagents.delete(running.id);
       } else {
-        running.abortController = undefined;
-        running.turn = (running.turn ?? 1) + 1;
-        running.turnStartTime = Date.now();
+        // Keep a keepOpen entry unless its pane is confirmed gone. This is the
+        // handle `subagent_stop` uses to close a leftover pane.
+        const stillThere = await paneExistsAsync(surface);
+        if (stillThere === false) {
+          runningSubagents.delete(running.id);
+        } else {
+          running.abortController = undefined;
+          running.turn = (running.turn ?? 1) + 1;
+          running.turnStartTime = Date.now();
+        }
       }
 
       running.delivery = { turn: deliveryTurn, state: "pending" };
@@ -1678,12 +1838,20 @@ async function watchSubagent(
       await new Promise((r) => setTimeout(r, 500));
       terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
     }
-    if (!running.interactive || !isSurfaceAlive(surface)) {
+    if (!running.interactive) {
       runningSubagents.delete(running.id);
     } else {
-      running.abortController = undefined;
-      running.turn = (running.turn ?? 1) + 1;
-      running.turnStartTime = Date.now();
+      // A keepOpen turn is over, but its pane is the only handle the user has.
+      // Only a confirmed absence may discard the entry; an unreadable Herdr
+      // inventory keeps it so subagent_stop can still close the pane.
+      const stillThere = await paneExistsAsync(surface);
+      if (stillThere === false) {
+        runningSubagents.delete(running.id);
+      } else {
+        running.abortController = undefined;
+        running.turn = (running.turn ?? 1) + 1;
+        running.turnStartTime = Date.now();
+      }
     }
 
     running.delivery = { turn: deliveryTurn, state: "pending" };
@@ -1918,6 +2086,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: running.sessionFile,
           sessionId: getSessionId(running.sessionFile),
           runner: running.cli,
+          surface: running.surface,
+          herdrAgentName: running.herdrAgentName,
         });
 
         // Create a separate AbortController for the watcher
@@ -2079,16 +2249,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const config = getSubagentConfig();
         const list = discoverAgentDefinitions()
           .filter((agent) => !agent.disableModelInvocation)
-          .map((agent) => ({
-            ...agent,
-            resolvedModel: resolveModel({
-              agentName: agent.name,
-              agentModel: agent.model,
-              config: config.models,
-              env: process.env,
-              parentModel: formatParentModel(ctx?.model),
-            }).model,
-          }));
+          .map((agent) => {
+            const runner = normalizeRunner(agent.cli) ?? "pi";
+            return {
+              ...agent,
+              resolvedModel: resolveModel({
+                agentName: agent.name,
+                agentModel: agent.model,
+                config: config.models,
+                env: process.env,
+                parentModel: parentModelForRunner(runner, ctx?.model) ?? undefined,
+              }).model,
+            };
+          });
 
         if (list.length === 0) {
           return {
@@ -2300,7 +2473,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        const surface = createSubagentSurface(name, loadout.cwd ?? process.cwd(), {});
+        const surface = await createSubagentSurface(name, loadout.cwd ?? process.cwd(), {});
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         const sessionId = ctx.sessionManager.getSessionId();
@@ -2385,6 +2558,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }),
         };
         runningSubagents.set(id, running);
+        // Keep the persistent handle current: a later stop-by-name must target
+        // this resumed pane, not the one the session originally ran in.
+        registerName(parentArtifactDir, name, {
+          sessionFile: sessionPath,
+          sessionId: resumedSessionId,
+          runner: "pi",
+          surface,
+          herdrAgentName: running.herdrAgentName,
+        });
         ensureMonitorStarted();
 
         // Fire-and-forget watcher
@@ -2508,9 +2690,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     label: "Stop Subagent",
     description:
       "Stop a running subagent, abort its background watcher, dismiss its UI widget, and optionally close its pane in Herdr. " +
-      "Use this when a subagent is no longer needed, was closed by the user, has errored or stalled, or needs to be terminated.",
+      "Use this when a subagent is no longer needed, was closed by the user, has errored or stalled, or needs to be terminated. " +
+      "A completed keepOpen subagent can also be stopped by name: its leftover pane is resolved through the session's name registry.",
     promptSnippet:
-      "Stop a running subagent by name, dismiss its UI widget, and optionally close its pane.",
+      "Stop a running subagent by name (or a completed keepOpen one), dismiss its UI widget, and optionally close its pane.",
     parameters: Type.Object({
       name: Type.Optional(
         Type.String({
@@ -2552,11 +2735,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const parentSessionId = ctx?.sessionManager?.getSessionId?.();
+      const artifactDir = artifactDirForContext(ctx);
       const visible = Array.from(runningSubagents.values()).filter(
         (r) => !r.parentSessionId || r.parentSessionId === parentSessionId,
       );
 
       if (visible.length === 0) {
+        // A keepOpen subagent that has finished is no longer in the running
+        // map, but its pane still exists. The name registry is the only handle
+        // left, and a named stop must be able to close it.
+        if (params.name?.trim()) {
+          const fallback = stopCompletedByName(
+            params.name.trim(),
+            artifactDir,
+            params.closePane !== false,
+          );
+          if (fallback.handled) {
+            return {
+              content: [{ type: "text", text: fallback.message }],
+              details: fallback.details ?? { stopped: false, reason: "registry" },
+            };
+          }
+        }
         return {
           content: [{ type: "text", text: "No subagents are currently running." }],
           details: { stopped: false, reason: "none_running" },
@@ -2568,6 +2768,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const requested = params.name.trim().toLowerCase();
         target = visible.find((r) => r.name.toLowerCase() === requested);
         if (!target) {
+          const fallback = stopCompletedByName(
+            params.name.trim(),
+            artifactDir,
+            params.closePane !== false,
+          );
+          if (fallback.handled) {
+            return {
+              content: [{ type: "text", text: fallback.message }],
+              details: fallback.details ?? { stopped: false, reason: "registry" },
+            };
+          }
           const names = visible.map((r) => r.name);
           return {
             content: [
@@ -2639,7 +2850,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
       if (target.toLowerCase() === "stop" || target.toLowerCase() === "kill") {
-        const msg = stopSubagentByName(rest, ctx?.sessionManager?.getSessionId?.());
+        const msg = stopSubagentByName(
+          rest,
+          ctx?.sessionManager?.getSessionId?.(),
+          artifactDirForContext(ctx),
+        );
         ctx.ui.notify(msg, msg.includes("No running") || msg.includes("Multiple") ? "warning" : "info");
         return;
       }
@@ -2687,7 +2902,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.registerCommand("subagent:stop", {
     description: "Stop a running subagent: /subagent:stop [name|all]",
     handler: async (args, ctx) => {
-      const msg = stopSubagentByName(args, ctx?.sessionManager?.getSessionId?.());
+      const msg = stopSubagentByName(
+        args,
+        ctx?.sessionManager?.getSessionId?.(),
+        artifactDirForContext(ctx),
+      );
       ctx.ui.notify(msg, msg.includes("No running") || msg.includes("Multiple") ? "warning" : "info");
     },
   });

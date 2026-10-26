@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -330,5 +330,36 @@ describe("adapter result extraction", () => {
       ),
       { summary: "codex done" },
     );
+  });
+});
+
+describe("claude adapter launch plan", () => {
+  it("passes a multi-line agent body by file, never as a single argv value", () => {
+    const body = "Line one.\nLine two.\n\n## Process\n1. Do the work.";
+    const plan = claudeAdapter.buildLaunch(
+      makeCtx({
+        platform: "win32",
+        artifactDir: dir,
+        agent: { body },
+      }),
+    );
+
+    const flagIndex = plan.startArgs.indexOf("--append-system-prompt-file");
+    assert.ok(flagIndex >= 0, "expected --append-system-prompt-file");
+    const promptFile = plan.startArgs[flagIndex + 1];
+    assert.ok(promptFile.startsWith(join(dir, "context")));
+    assert.equal(readFileSync(promptFile, "utf8"), body);
+    assert.equal(plan.startArgs.includes("--append-system-prompt"), false);
+    for (const arg of plan.startArgs) {
+      assert.ok(!arg.includes("\n"), `agent start arg contains a newline: ${arg}`);
+    }
+    assert.equal(plan.prompt, "do it");
+  });
+
+  it("passes an explicitly resolved model", () => {
+    const plan = claudeAdapter.buildLaunch(makeCtx({ model: "claude-sonnet-5-5" }));
+    const index = plan.startArgs.indexOf("--model");
+    assert.ok(index >= 0);
+    assert.equal(plan.startArgs[index + 1], "claude-sonnet-5-5");
   });
 });

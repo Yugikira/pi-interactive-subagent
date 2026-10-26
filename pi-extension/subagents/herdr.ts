@@ -194,21 +194,95 @@ export function sanitizeAgentName(name: string): string {
 
 // ── Low-level Herdr CLI Execution ──
 
+/** A short, safe label for diagnostics (never includes task text or env). */
+function describeHerdrCommand(args: string[]): string {
+  return `herdr ${args.slice(0, 3).join(" ")}`;
+}
+
+function textFrom(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  return "";
+}
+
+/**
+ * Prefer the last embedded `{"error":…}` object. The prompt/task text can
+ * itself contain `"code"`/`"message"` keys; a plain regex over the whole
+ * "Command failed" blob could pick those up instead of Herdr's payload.
+ */
+function errorPayloadFrom(raw: string): { code: string; message: string } | null {
+  const marker = raw.lastIndexOf('{"error"');
+  if (marker >= 0) {
+    try {
+      const data = JSON.parse(raw.slice(marker));
+      if (data?.error) {
+        return {
+          code: data.error.code ?? "error",
+          message: data.error.message ?? JSON.stringify(data.error),
+        };
+      }
+    } catch {
+      // A truncated payload falls back to the regex parser.
+    }
+  }
+  return parseHerdrError(raw);
+}
+
+/**
+ * Herdr prints `{"error":{...}}` and exits non-zero for some failures, so the
+ * JSON arrives inside the thrown error's stdout rather than as a normal
+ * response. Surface the code/message instead of a 1 KB "Command failed" blob.
+ */
+function asHerdrFailure(error: unknown, args: string[]): Error {
+  const context = describeHerdrCommand(args);
+  // Check the child's own output first; the generic "Command failed" message
+  // repeats stderr and can also contain task text.
+  const sources = [
+    textFrom((error as any)?.stderr),
+    textFrom((error as any)?.stdout),
+    textFrom((error as any)?.message),
+  ];
+  for (const source of sources) {
+    if (!source) continue;
+    const parsed = errorPayloadFrom(source);
+    if (parsed) return new Error(`${context}: ${parsed.code}: ${parsed.message}`);
+  }
+  return error instanceof Error ? error : new Error(`${context}: ${String(error)}`);
+}
+
 function execHerdrSync(args: string[], options?: { timeout?: number }): string {
   requireHerdr();
-  return herdrDeps.run(args, { timeoutMs: options?.timeout });
+  const started = Date.now();
+  try {
+    const raw = herdrDeps.run(args, { timeoutMs: options?.timeout });
+    logHerdr(`${describeHerdrCommand(args)} ok ${Date.now() - started}ms`);
+    return raw;
+  } catch (err) {
+    const failure = asHerdrFailure(err, args);
+    logHerdr(`${describeHerdrCommand(args)} failed ${Date.now() - started}ms: ${failure.message}`);
+    throw failure;
+  }
 }
 
 async function execHerdrAsync(args: string[], options?: { timeout?: number }): Promise<string> {
   requireHerdr();
-  if (herdrDeps.runAsync) {
-    return herdrDeps.runAsync(args, { timeoutMs: options?.timeout });
+  const started = Date.now();
+  try {
+    const raw = herdrDeps.runAsync
+      ? await herdrDeps.runAsync(args, { timeoutMs: options?.timeout })
+      : (
+          await execFileAsync(HERDR_BIN, args, {
+            encoding: "utf8",
+            timeout: options?.timeout ?? 60_000,
+          })
+        ).stdout;
+    logHerdr(`${describeHerdrCommand(args)} ok ${Date.now() - started}ms`);
+    return raw;
+  } catch (err) {
+    const failure = asHerdrFailure(err, args);
+    logHerdr(`${describeHerdrCommand(args)} failed ${Date.now() - started}ms: ${failure.message}`);
+    throw failure;
   }
-  const { stdout } = await execFileAsync(HERDR_BIN, args, {
-    encoding: "utf8",
-    timeout: options?.timeout ?? 60_000,
-  });
-  return stdout;
 }
 
 /**
@@ -317,6 +391,18 @@ export function getTabLayout(surface?: string | null): TabLayout | null {
   }
 }
 
+/** Async layout read for the launch path. */
+export async function getTabLayoutAsync(surface?: string | null): Promise<TabLayout | null> {
+  if (!herdrDeps.available()) return null;
+  try {
+    const args = ["pane", "layout", surface ? "--pane" : "--current"];
+    if (surface) args.push(surface);
+    return parsePaneLayout(await execHerdrAsync(args, { timeout: 5_000 }));
+  } catch {
+    return null;
+  }
+}
+
 /** The pane this extension is running in, if Herdr exposes it. */
 export function currentPaneId(): string | null {
   const fromEnv = process.env.HERDR_PANE_ID;
@@ -331,9 +417,13 @@ export function currentPaneId(): string | null {
   }
 }
 
-/** Create a new tab and return its root pane id. */
-function createTabSurface(options?: CreateSurfaceOptions): string {
-  requireHerdr();
+/**
+ * A split is a UI operation on a server that answers other clients serially;
+ * 15 s leaves room for a busy Herdr without hanging the extension host forever.
+ */
+const SURFACE_CREATE_TIMEOUT_MS = 15_000;
+
+function buildTabArgs(options?: CreateSurfaceOptions): string[] {
   const args = ["tab", "create", "--no-focus"];
   if (options?.cwd) args.push("--cwd", options.cwd);
   if (options?.env) {
@@ -341,27 +431,11 @@ function createTabSurface(options?: CreateSurfaceOptions): string {
       args.push("--env", `${key}=${value}`);
     }
   }
-  const data = parseHerdrResponse(execHerdrSync(args), "herdr tab create");
-  const root = data?.result?.root_pane;
-  const paneId = typeof root?.pane_id === "string" ? root.pane_id : root;
-  if (typeof paneId !== "string" || !paneId) {
-    throw new Error(`Unexpected herdr tab create response: ${JSON.stringify(data)}`);
-  }
-  return paneId;
+  return args;
 }
 
-/**
- * Create a new sibling pane split for a subagent.
- * Defaults to splitting right off the current pane without stealing keyboard focus.
- * Returns the new pane id (e.g. `w1:p2`).
- */
-export function createSurface(name: string, options?: CreateSurfaceOptions): string {
-  void name;
-  requireHerdr();
-
+function buildSplitArgs(options?: CreateSurfaceOptions): string[] {
   const layout = options?.layout ?? options?.direction ?? "right";
-  if (layout === "tab") return createTabSurface(options);
-
   const direction = layout === "down" ? "down" : "right";
   const args = ["pane", "split"];
 
@@ -386,16 +460,80 @@ export function createSurface(name: string, options?: CreateSurfaceOptions): str
       args.push("--env", `${k}=${v}`);
     }
   }
+  return args;
+}
 
-  const raw = execHerdrSync(args);
+function parseSplitResponse(raw: string): string {
   const data = parseHerdrResponse(raw, "herdr pane split");
   const paneId = data?.result?.pane?.pane_id ?? data?.pane?.pane_id ?? data?.pane_id;
-
-  if (typeof paneId !== "string" || !paneId) {
+  if (!data || typeof paneId !== "string" || !paneId) {
     throw new Error(`Unexpected herdr pane split response: ${raw}`);
   }
-
   return paneId;
+}
+
+function parseTabResponse(raw: string): string {
+  const data = parseHerdrResponse(raw, "herdr tab create");
+  const root = data?.result?.root_pane;
+  const paneId = typeof root?.pane_id === "string" ? root.pane_id : root;
+  if (!data || typeof paneId !== "string" || !paneId) {
+    throw new Error(`Unexpected herdr tab create response: ${raw}`);
+  }
+  return paneId;
+}
+
+/** Create a new tab and return its root pane id. */
+function createTabSurface(options?: CreateSurfaceOptions): string {
+  requireHerdr();
+  return parseTabResponse(
+    execHerdrSync(buildTabArgs(options), { timeout: SURFACE_CREATE_TIMEOUT_MS }),
+  );
+}
+
+async function createTabSurfaceAsync(options?: CreateSurfaceOptions): Promise<string> {
+  requireHerdr();
+  return parseTabResponse(
+    await execHerdrAsync(buildTabArgs(options), { timeout: SURFACE_CREATE_TIMEOUT_MS }),
+  );
+}
+
+/**
+ * Create a new sibling pane split for a subagent.
+ * Defaults to splitting right off the current pane without stealing keyboard focus.
+ * Returns the new pane id (e.g. `w1:p2`).
+ */
+export function createSurface(name: string, options?: CreateSurfaceOptions): string {
+  void name;
+  requireHerdr();
+
+  const layout = options?.layout ?? options?.direction ?? "right";
+  if (layout === "tab") return createTabSurface(options);
+
+  return parseSplitResponse(
+    execHerdrSync(buildSplitArgs(options), { timeout: SURFACE_CREATE_TIMEOUT_MS }),
+  );
+}
+
+/**
+ * Async surface creation for the launch path.
+ *
+ * The launch flow awaits this, so the TUI stays responsive and a slow/busy
+ * Herdr is bounded by an explicit timeout instead of blocking the event loop.
+ * `createSurface` remains for synchronous callers (resume fallbacks/tests).
+ */
+export async function createSurfaceAsync(
+  name: string,
+  options?: CreateSurfaceOptions,
+): Promise<string> {
+  void name;
+  requireHerdr();
+
+  const layout = options?.layout ?? options?.direction ?? "right";
+  if (layout === "tab") return createTabSurfaceAsync(options);
+
+  return parseSplitResponse(
+    await execHerdrAsync(buildSplitArgs(options), { timeout: SURFACE_CREATE_TIMEOUT_MS }),
+  );
 }
 
 /** Backward compatibility alias for createSurface. */
@@ -479,6 +617,16 @@ export async function listPanesAsync(
  */
 export function paneExists(surface: string, onError?: (message: string) => void): boolean | null {
   const panes = listPanes(onError);
+  if (!panes) return null;
+  return panes.some((pane) => pane.paneId === surface);
+}
+
+/** Async tri-state pane existence for the completion/lifecycle path. */
+export async function paneExistsAsync(
+  surface: string,
+  onError?: (message: string) => void,
+): Promise<boolean | null> {
+  const panes = await listPanesAsync(onError);
   if (!panes) return null;
   return panes.some((pane) => pane.paneId === surface);
 }
@@ -644,16 +792,16 @@ export function terminateSurface(
 
 let surfaceAliveOverride: ((surface: string) => boolean) | null = null;
 
-/** Check whether a pane surface still exists in Herdr. */
+/**
+ * Check whether a pane surface still exists in Herdr.
+ *
+ * Only a confirmed absence returns false. A timed-out or unreadable inventory
+ * is treated as "still there": `pane read` is slower than the inventory, and
+ * treating its failure as death is what orphaned keepOpen panes.
+ */
 export function isSurfaceAlive(surface: string): boolean {
   if (surfaceAliveOverride) return surfaceAliveOverride(surface);
-  if (!isHerdrAvailable()) return false;
-  try {
-    execHerdrSync(["pane", "read", surface, "--lines", "1"], { timeout: 3_000 });
-    return true;
-  } catch {
-    return false;
-  }
+  return paneExists(surface) !== false;
 }
 
 /** Send raw command to run in a pane. */

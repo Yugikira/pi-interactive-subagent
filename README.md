@@ -46,7 +46,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagent` | Spawn a sub-agent in a dedicated Herdr pane (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its Pi session if finished |
 | `subagent_interrupt` | Send Escape to the active **Pi** turn without closing the pane or session |
-| `subagent_stop` | Stop a running sub-agent and close its pane (optionally keep the pane with `closePane: false`) |
+| `subagent_stop` | Stop a running sub-agent and close its pane (optionally keep the pane with `closePane: false`). A completed `keepOpen` sub-agent can still be stopped by name — its leftover pane is tracked in the session's name registry. |
 | `subagents_list` | List available agent definitions and supported CLI runners |
 | `ask_question` | *(Pi sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
@@ -87,8 +87,10 @@ The bundled agents are provider-neutral. A model is resolved once per spawn, in 
 3. `models.agents.<name>` in `config.json`
 4. `PI_SUBAGENT_DEFAULT_MODEL`
 5. `models.default` in `config.json`
-6. the parent session's active model
-7. none — the child uses Pi's own configured default
+6. the parent session's active model — **Pi runner only**: `ctx.model` is a Pi catalog id
+   (`provider/id`), so it is never passed to `agy`, `claude`, `codex`, `grok`, or `opencode`.
+   Those runners use their own configured model unless an explicit/config/frontmatter model is set.
+7. none — the child uses its CLI's own configured default
 
 ### Messaging
 
@@ -111,6 +113,11 @@ session, and watcher stay alive, so you can follow up with `subagent_message` or
 `subagent_stop({ name, closePane })` aborts the watcher, terminates the child process, and closes
 the pane. A stop that cannot be verified is reported as a failure rather than a success.
 
+A `keepOpen` sub-agent that has already completed is no longer in the in-memory running list, but
+its pane may still be open. `subagent_stop({ name })` resolves it through the session's persistent
+name registry, closes the leftover pane, and refuses to touch a pane that now belongs to another
+agent. An unreadable Herdr inventory is reported as unverified, never as a clean stop.
+
 ### ask_question
 
 A Pi sub-agent can ask its orchestrator a single freeform question when requirements are
@@ -129,8 +136,10 @@ ambiguous or a decision materially affects the work. The session **stays open** 
 | `grok` | JSON output protocol | yes | no | no |
 | `opencode` | JSON output protocol | yes | no | no |
 
-The `model` override is applied to `pi`, `claude`, and `agy`. Protocol runners receive the task
-text only; set their model in the CLI's own configuration.
+An explicit/config/frontmatter `model` is applied to `pi`, `claude`, and `agy` (Herdr rejects
+multi-line CLI arguments, so Claude agent identities are passed with
+`--append-system-prompt-file`). Protocol runners receive the task text only; set their model in
+the CLI's own configuration. The parent Pi model is inherited by the `pi` runner only.
 
 ## Layout
 
