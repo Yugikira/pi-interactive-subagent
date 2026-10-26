@@ -111,6 +111,30 @@ describe("herdr.ts layout primitives", () => {
     assert.equal(parsePaneLayout("nope"), null);
   });
 
+  it("anchors a split to the caller pane instead of --current", () => {
+    const previous = process.env.HERDR_PANE_ID;
+    process.env.HERDR_PANE_ID = "w1:p1";
+    const calls: string[][] = [];
+    restore = setHerdrExecDeps({
+      available: () => true,
+      run: (args) => {
+        calls.push(args);
+        return JSON.stringify({ result: { pane: { pane_id: "w1:p2" } } });
+      },
+    });
+
+    try {
+      createSurface("scout", { layout: "right" });
+      const paneIndex = calls[0].indexOf("--pane");
+      assert.ok(paneIndex >= 0, "expected --pane");
+      assert.equal(calls[0][paneIndex + 1], "w1:p1");
+      assert.equal(calls[0].includes("--current"), false);
+    } finally {
+      if (previous === undefined) delete process.env.HERDR_PANE_ID;
+      else process.env.HERDR_PANE_ID = previous;
+    }
+  });
+
   it("creates a tab and returns its root pane", () => {
     const calls: string[][] = [];
     restore = setHerdrExecDeps({

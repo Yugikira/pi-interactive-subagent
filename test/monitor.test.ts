@@ -190,4 +190,24 @@ describe("monitor.ts ticker", () => {
     ticker.stop();
     assert.equal(ticker.skippedTicks, 0);
   });
+
+  it("exposes a running flag and restarts after stopping", () => {
+    const ticker = createTicker(() => [makeEntry()], makeDeps(), 10);
+    assert.equal(ticker.running, false);
+    ticker.start();
+    assert.equal(ticker.running, true);
+    ticker.stop();
+    assert.equal(ticker.running, false);
+    ticker.start();
+    assert.equal(ticker.running, true);
+    ticker.stop();
+  });
+
+  it("marks itself stopped when there is nothing to observe", async () => {
+    const ticker = createTicker(() => [], makeDeps(), 10);
+    ticker.start();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(ticker.running, false);
+    ticker.stop();
+  });
 });

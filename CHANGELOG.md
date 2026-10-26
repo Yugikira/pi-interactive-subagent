@@ -2,6 +2,23 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [3.10.2] - 2026-10-26
+
+### Fixed
+
+- **Spawn → stop → spawn no longer splits the wrong pane.** Right/down splits now anchor to
+  the caller's pane (`HERDR_PANE_ID`) instead of Herdr's `--current`. Closing a subagent shifts
+  focus, so subsequent spawns could split an unrelated tab.
+- **The observation monitor restarts after the last subagent exits.** The ticker stops itself
+  when there is nothing to observe but the wrapper object stayed non-null; `ensureMonitorStarted`
+  now checks whether it is actually running and recreates it.
+- **Stop no longer addresses an unregistered agent.** `terminateSurface` checks the pane
+  inventory first and uses pane keys when the expected agent is not registered there, avoiding
+  Herdr's `agent target not found` error cascade after a child dies during startup.
+- **Agent startup is async and bounded.** `herdr agent start` is now awaited through the async
+  seam with a 15s readiness timeout instead of a 30s+ synchronous `execFileSync` block, so a
+  failed child reports a clean failure instead of `spawnSync herdr.exe ETIMEDOUT`.
+
 ## [3.10.1] - 2026-10-26
 
 ### Fixed

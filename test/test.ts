@@ -111,6 +111,8 @@ function makeRunning(overrides: Record<string, unknown> = {}) {
 interface FakePane {
   /** `herdr pane close` rejects for this pane. */
   closeFails?: boolean;
+  /** Registered agent name, as `pane list` would report it. */
+  agent?: string;
 }
 
 function herdrError(code: string, message: string): string {
@@ -128,9 +130,7 @@ function createFakeHerdr(
   const keyWrites: string[][] = [];
   let paneListFailures = options?.paneListFailsTimes ?? 0;
 
-  const deps = {
-    available: () => true,
-    run: (args: string[]): string => {
+  const run = (args: string[]): string => {
       calls.push(args);
       const [group, verb] = args;
 
@@ -142,7 +142,12 @@ function createFakeHerdr(
           throw new Error(herdrError("internal_error", "pane inventory unavailable"));
         }
         return JSON.stringify({
-          result: { panes: Array.from(panes.keys()).map((paneId) => ({ pane_id: paneId })) },
+          result: {
+            panes: Array.from(panes.entries()).map(([paneId, pane]) => ({
+              pane_id: paneId,
+              ...(pane.agent ? { agent: pane.agent } : {}),
+            })),
+          },
         });
       }
 
@@ -169,7 +174,12 @@ function createFakeHerdr(
       }
 
       throw new Error(herdrError("invalid_request", `unhandled fake call: ${args.join(" ")}`));
-    },
+  };
+
+  const deps = {
+    available: () => true,
+    run,
+    runAsync: async (args: string[]) => run(args),
   };
 
   return { panes, calls, keyWrites, deps };
@@ -3062,7 +3072,7 @@ describe("subagent interruption", () => {
     });
 
     it("sends keys through the agent name, falling back to the pane", () => {
-      const direct = createFakeHerdr({ "w1:p2": {} }, { agentNames: ["test"] });
+      const direct = createFakeHerdr({ "w1:p2": { agent: "test" } }, { agentNames: ["test"] });
       const restoreDirect = setHerdrExecDeps(direct.deps);
       try {
         terminateSurface("w1:p2", { agentName: "test" });
@@ -3078,6 +3088,24 @@ describe("subagent interruption", () => {
         assert.deepStrictEqual(fallback.keyWrites, [["pane:w1:p2", "ctrl+c", "ctrl+c"]]);
       } finally {
         restoreFallback();
+      }
+    });
+
+    it("uses pane keys instead of an unregistered agent target", () => {
+      // The agent may exist elsewhere, but this pane does not report it (e.g.
+      // the child died during startup). Addressing it by name makes Herdr log
+      // `agent target not found`; the pane is the reliable target.
+      const world = createFakeHerdr({ "w1:p2": {} }, { agentNames: ["test"] });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const outcome = terminateSurface("w1:p2", { agentName: "test" });
+        assert.deepStrictEqual(world.keyWrites, [["pane:w1:p2", "ctrl+c", "ctrl+c"]]);
+        assert.equal(
+          outcome.errors.some((error) => /agent target/.test(error)),
+          false,
+        );
+      } finally {
+        restore();
       }
     });
 

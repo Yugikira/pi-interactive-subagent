@@ -21,7 +21,7 @@ import {
   terminateSurface,
   isSurfaceAlive,
   readScreen,
-  startAgent,
+  startAgentAsync,
   promptAgent,
   getAgentState,
   readAgentOutput,
@@ -967,7 +967,10 @@ function createMonitorDeps(): MonitorDeps {
 }
 
 function ensureMonitorStarted(): void {
-  if (monitor) return;
+  // The ticker stops itself when there is nothing to observe; the object can
+  // outlive its timer, so check `running` rather than mere existence.
+  if (monitor?.running) return;
+  monitor?.stop();
   monitor = createTicker(() => Array.from(runningSubagents.values()), createMonitorDeps(), 1_000);
   monitor.start();
   (globalThis as any)[MONITOR_KEY] = monitor;
@@ -1138,6 +1141,13 @@ export const __test__ = {
 /** Panes created by this extension, used for smart tiling. */
 const trackedSurfaces = new Set<string>();
 
+/**
+ * Bound how long a failed child can block the spawn call. Herdr's default
+ * readiness wait is 30s; a child that exits on a bad model should not freeze
+ * the extension host for that long.
+ */
+const AGENT_START_TIMEOUT_MS = 15_000;
+
 /** Create the subagent pane according to `PI_SUBAGENT_LAYOUT`. */
 function createSubagentSurface(
   displayName: string,
@@ -1149,7 +1159,12 @@ function createSubagentSurface(
     return createSurface(displayName, { cwd, env, layout: "tab" });
   }
   if (mode === "down") {
-    return createSurface(displayName, { cwd, env, layout: "down" });
+    return createSurface(displayName, {
+      cwd,
+      env,
+      layout: "down",
+      fromSurface: currentPaneId() ?? undefined,
+    });
   }
   if (mode === "smart") {
     const caller = currentPaneId();
@@ -1169,8 +1184,13 @@ function createSubagentSurface(
     trackedSurfaces.add(surface);
     return surface;
   }
-  // Default: preserve the historical right split off the caller's pane.
-  return createSurface(displayName, { cwd, env, layout: "right" });
+  // Default: preserve the historical right split, anchored to the caller.
+  return createSurface(displayName, {
+    cwd,
+    env,
+    layout: "right",
+    fromSurface: currentPaneId() ?? undefined,
+  });
 }
 
 /**
@@ -1337,7 +1357,10 @@ async function launchSubagent(
   try {
     if (adapter.id === "pi") {
       try {
-        startAgent(herdrAgentName, "pi", surface, { args: plan.startArgs });
+        await startAgentAsync(herdrAgentName, "pi", surface, {
+          args: plan.startArgs,
+          timeoutMs: AGENT_START_TIMEOUT_MS,
+        });
       } catch {
         sendLongCommand(surface, plan.fallbackCommand ?? "", {
           scriptPath: launchScriptFile!,
@@ -1346,7 +1369,10 @@ async function launchSubagent(
       }
     } else {
       try {
-        startAgent(herdrAgentName, adapter.id, surface, { args: plan.startArgs });
+        await startAgentAsync(herdrAgentName, adapter.id, surface, {
+          args: plan.startArgs,
+          timeoutMs: AGENT_START_TIMEOUT_MS,
+        });
       } catch {
         // Herdr returns agent_not_ready if the agent is blocked on startup
         // (e.g. a workspace trust prompt). Accept it and retry the launch.

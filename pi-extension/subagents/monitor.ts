@@ -239,6 +239,7 @@ export interface Ticker {
   start(): void;
   stop(): void;
   tick(): Promise<boolean>;
+  readonly running: boolean;
   readonly skippedTicks: number;
 }
 
@@ -249,6 +250,7 @@ export function createTicker(
   intervalMs = 1_000,
 ): Ticker {
   let timer: ReturnType<typeof setInterval> | null = null;
+  let running = false;
   let inFlight = false;
   let skipped = 0;
 
@@ -268,11 +270,13 @@ export function createTicker(
   const stopTimer = () => {
     if (timer) clearInterval(timer);
     timer = null;
+    running = false;
   };
 
   return {
     start() {
       if (timer) return;
+      running = true;
       timer = setInterval(() => {
         void tick()
           .then((hasEntries) => {
@@ -286,6 +290,9 @@ export function createTicker(
     },
     stop: stopTimer,
     tick,
+    get running() {
+      return running;
+    },
     get skippedTicks() {
       return skipped;
     },

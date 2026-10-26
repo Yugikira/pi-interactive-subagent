@@ -32,6 +32,8 @@ export interface HerdrExecDeps {
   available(): boolean;
   /** Run herdr synchronously; throws on non-zero exit (herdr's error JSON is in the message). */
   run(args: string[], options?: { timeoutMs?: number }): string;
+  /** Async variant used by launch/monitor paths; falls back to execFile. */
+  runAsync?(args: string[], options?: { timeoutMs?: number }): Promise<string>;
 }
 
 const defaultHerdrDeps: HerdrExecDeps = {
@@ -42,6 +44,13 @@ const defaultHerdrDeps: HerdrExecDeps = {
       timeout: options?.timeoutMs ?? 60_000,
       stdio: ["pipe", "pipe", "pipe"],
     }),
+  runAsync: async (args, options) => {
+    const { stdout } = await execFileAsync(HERDR_BIN, args, {
+      encoding: "utf8",
+      timeout: options?.timeoutMs ?? 60_000,
+    });
+    return stdout;
+  },
 };
 
 let herdrDeps: HerdrExecDeps = defaultHerdrDeps;
@@ -192,6 +201,9 @@ function execHerdrSync(args: string[], options?: { timeout?: number }): string {
 
 async function execHerdrAsync(args: string[], options?: { timeout?: number }): Promise<string> {
   requireHerdr();
+  if (herdrDeps.runAsync) {
+    return herdrDeps.runAsync(args, { timeoutMs: options?.timeout });
+  }
   const { stdout } = await execFileAsync(HERDR_BIN, args, {
     encoding: "utf8",
     timeout: options?.timeout ?? 60_000,
@@ -329,8 +341,12 @@ export function createSurface(name: string, options?: CreateSurfaceOptions): str
   const direction = layout === "down" ? "down" : "right";
   const args = ["pane", "split"];
 
-  if (options?.fromSurface) {
-    args.push("--pane", options.fromSurface);
+  // Anchor to the caller's pane rather than Herdr's "current" pane: closing a
+  // subagent shifts keyboard focus, and `--current` would then split an
+  // unrelated tab on the next spawn.
+  const fromSurface = options?.fromSurface ?? currentPaneId();
+  if (fromSurface) {
+    args.push("--pane", fromSurface);
   } else {
     args.push("--current");
   }
@@ -532,20 +548,31 @@ export function terminateSurface(
 
   logHerdr(`terminate surface=${surface} closePane=${options?.closePane !== false}`);
 
-  const exists = paneExists(surface, onError);
-  logHerdr(`  paneExists=${exists}`);
-  // Only a *confirmed* absence short-circuits. "Cannot tell" falls through to
-  // the actual stop attempt.
-  if (exists === false) {
-    return { ...base, ok: true, paneClosed: true, method: "not-alive" };
+  const panes = listPanes(onError);
+  logHerdr(`  paneList=${panes === null ? "unreadable" : panes.length}`);
+  let knownAgent: string | undefined;
+  if (panes !== null) {
+    const pane = panes.find((candidate) => candidate.paneId === surface);
+    // Only a *confirmed* absence short-circuits. "Cannot tell" falls through
+    // to the actual stop attempt.
+    if (!pane) {
+      return { ...base, ok: true, paneClosed: true, method: "not-alive" };
+    }
+    knownAgent = pane.agent;
   }
 
-  // Ask the runner's TUI to exit: agent keys, falling back to the raw pane.
-  if (options?.agentName) {
+  // Address the agent by name only when the pane inventory confirms that agent
+  // is actually registered there. Otherwise Herdr logs `agent target not found`
+  // for every stop of an agent that died during startup, and the cascade hides
+  // the real failure.
+  const agentName = options?.agentName;
+  const canUseAgent =
+    !!agentName && (panes === null || knownAgent === agentName);
+  if (canUseAgent && agentName) {
     let agentError: string | null = null;
     try {
-      sendAgentKeys(options.agentName, ["ctrl+c", "ctrl+c"]);
-      attempted.push(`agent send-keys ${options.agentName} ctrl+c ctrl+c`);
+      sendAgentKeys(agentName, ["ctrl+c", "ctrl+c"]);
+      attempted.push(`agent send-keys ${agentName} ctrl+c ctrl+c`);
     } catch (err) {
       // Held back: if the pane fallback lands, the keys still arrived and this
       // is recoverable noise rather than a failure worth reporting.
