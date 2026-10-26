@@ -1,6 +1,6 @@
 {
   "name": "interactive-subagents",
-  "version": "3.10.7",
+  "version": "3.10.8",
   "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in Herdr (pi, agy, claude, codex, grok, opencode)",
   "keywords": [
     "pi-package",

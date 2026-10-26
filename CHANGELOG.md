@@ -2,6 +2,17 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [3.10.8] - 2026-10-27
+
+### Fixed
+
+- **A slow Herdr readiness check no longer kills a started Agy/Claude agent.** `herdr agent start`
+  can return a readiness timeout after the agent has already registered. The pane inventory reports
+  the runner kind (`agy`, `claude`), not the custom Herdr name, so the registration check missed it,
+  retried `agent start` on the now-occupied pane (`agent_pane_busy`), and closed the pane. The check
+  now matches either the custom name or the runner kind, and an unreadable inventory after a genuine
+  startup timeout is trusted rather than retried.
+
 ## [3.10.7] - 2026-10-27
 
 ### Fixed

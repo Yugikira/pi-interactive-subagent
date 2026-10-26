@@ -1212,6 +1212,7 @@ export const __test__ = {
   discoverAgentDefinitions,
   resolveRunnerAndAgent,
   parentModelForRunner,
+  paneShowsAgent,
   normalizeRunner,
   isKnownRunner,
   RUNNER_KINDS,
@@ -1263,6 +1264,20 @@ const AGENT_START_TIMEOUT_MS = 8_000;
 const AGENT_START_ATTEMPTS = 2;
 
 /**
+ * The pane inventory reports the registered agent *kind* (`agy`, `claude`,
+ * `pi`, …), not the custom Herdr name. Match either: a start that timed out
+ * after registering the agent must not be retried (the second start sees
+ * `agent_pane_busy`) or killed.
+ */
+export function paneShowsAgent(
+  pane: { agent?: string },
+  name: string,
+  kind: string,
+): boolean {
+  return pane.agent === name || pane.agent === kind;
+}
+
+/**
  * Is the named agent registered in the pane we started?
  * `null` means Herdr could not tell (both the agent lookup and the pane
  * inventory failed), which must not be mistaken for a confirmed miss.
@@ -1270,12 +1285,13 @@ const AGENT_START_ATTEMPTS = 2;
 async function agentRegistrationState(
   name: string,
   surface: string,
+  kind: string,
 ): Promise<boolean | null> {
   const info = await getAgentStateAsync(name).catch(() => null);
   if (info) return !info.paneId || info.paneId === surface;
   const panes = await listPanesAsync().catch(() => null);
   if (panes === null) return null;
-  return panes.some((pane) => pane.paneId === surface && pane.agent === name);
+  return panes.some((pane) => pane.paneId === surface && paneShowsAgent(pane, name, kind));
 }
 
 /**
@@ -1311,11 +1327,18 @@ async function startAgentWithReadiness(
     // unreadable inventory is not a miss: a start command that reported success
     // is trusted through an unknown inventory, and a failed one is only
     // treated as success when registration is confirmed.
-    const registration = await agentRegistrationState(name, surface);
+    const registration = await agentRegistrationState(name, surface, kind);
     if (startError) {
       if (registration === true) return;
-      lastError = startError;
       const message = startError instanceof Error ? startError.message : String(startError);
+      // A readiness timeout means Herdr *accepted* the start but its probe
+      // timed out. If the pane inventory is also unreadable, do not retry or
+      // kill a possibly live agent; the prompt/result path will surface a real
+      // failure. (A confirmed miss still retries.)
+      if (registration === null && /timed out|timeout/i.test(message)) {
+        return;
+      }
+      lastError = startError;
       // Argument/shape errors are deterministic; retrying cannot fix them.
       if (/invalid_agent_argument|unknown option|invalid .*argument/i.test(message)) {
         throw startError;

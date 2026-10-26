@@ -4263,6 +4263,16 @@ describe("herdr.ts", () => {
     });
   });
 
+  describe("agent registration by pane kind", () => {
+    it("matches either the custom Herdr name or the runner kind", () => {
+      const testApi = (subagentsModule as any).__test__;
+      assert.equal(testApi.paneShowsAgent({ agent: "verify-agy" }, "verify-agy", "agy"), true);
+      assert.equal(testApi.paneShowsAgent({ agent: "agy" }, "verify-agy", "agy"), true);
+      assert.equal(testApi.paneShowsAgent({ agent: "claude" }, "verify-agy", "agy"), false);
+      assert.equal(testApi.paneShowsAgent({}, "verify-agy", "agy"), false);
+    });
+  });
+
   describe("parent model inheritance", () => {
     it("inherits the parent model only for the Pi runner", () => {
       const testApi = (subagentsModule as any).__test__;
