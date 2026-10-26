@@ -98,6 +98,24 @@ describe("monitor.ts tick", () => {
     });
   });
 
+  it("caches the pane's native session id on the entry", async () => {
+    const entry = makeEntry();
+    const deps = makeDeps({
+      listPanes: async () => [
+        {
+          paneId: "w1:p1",
+          agent: "scout",
+          agentStatus: "working",
+          agentSessionValue: "native-session-1",
+        },
+      ],
+    });
+
+    await runMonitorTick([entry], deps);
+
+    assert.equal(entry.sessionId, "native-session-1");
+  });
+
   it("delivers a question exactly once", async () => {
     let delivered = 0;
     let pending = true;

@@ -185,6 +185,12 @@ export async function runMonitorTick(
       if (!adapter) return;
 
       const pane = inspectEntry(entry, panes);
+      // The pane inventory already carries the runner's native session id.
+      // Cache it now so result extraction does not depend on a separate
+      // `agent get` that can time out while Herdr is busy.
+      if (pane.kind === "present" && pane.sessionId && !entry.sessionId) {
+        entry.sessionId = pane.sessionId;
+      }
       const activityRead = entry.activityFile
         ? await deps.readActivity(entry.activityFile, entry.id)
         : undefined;

@@ -2,6 +2,16 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [3.10.7] - 2026-10-27
+
+### Fixed
+
+- **Claude subagents deliver their native final message, not the raw terminal.** Result
+  extraction re-resolved the Claude session id with `herdr agent get` after the turn, which can
+  time out on a busy Herdr; the fallback then returned the entire Claude TUI. The monitor now
+  caches the pane inventory's `agent_session.value` on the running entry as soon as it appears,
+  so the native transcript reader is used reliably.
+
 ## [3.10.6] - 2026-10-27
 
 ### Fixed
