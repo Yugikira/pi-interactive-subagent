@@ -2300,6 +2300,45 @@ describe("tool registration", () => {
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
   });
 
+  it("reports Pi-only resume for a completed non-Pi subagent whose placeholder session file is absent", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const testApi = (subagentsModule as any).__test__;
+    testApi.runningSubagents.clear();
+
+    const sessionDir = createTestDir();
+    const sessionId = "resume-claude-parent";
+    const artifactDir = join(sessionDir, "artifacts", sessionId);
+    registerName(artifactDir, "claude-bot", {
+      sessionFile: join(sessionDir, "missing.jsonl"),
+      sessionId: "claude-session",
+      runner: "claude",
+    });
+    try {
+      const tool = registeredTools.find((t: any) => t.name === "subagent_message");
+      assert.ok(tool);
+      const ctx = {
+        sessionManager: {
+          getSessionFile: () => join(sessionDir, "parent.jsonl"),
+          getSessionId: () => sessionId,
+          getSessionDir: () => sessionDir,
+        },
+      };
+      const res = await tool.execute(
+        "call-message-1",
+        { name: "claude-bot", message: "continue" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(res.content[0].text, /only supported for Pi subagents/);
+      assert.doesNotMatch(res.content[0].text, /session file is gone/);
+    } finally {
+      rmSync(sessionDir, { recursive: true, force: true });
+      testApi.runningSubagents.clear();
+    }
+  });
+
   it("registers a Pi-only subagent_interrupt and no subagent_resume", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);

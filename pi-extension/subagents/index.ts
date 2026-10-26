@@ -2426,21 +2426,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        const sessionPath = entry.sessionFile;
-        if (!sessionPath || !existsSync(sessionPath)) {
-          const err =
-            `Subagent "${requestedName}" is registered but its session file is gone ` +
-            `(${sessionPath}). It cannot be resumed. Spawn a fresh subagent instead.`;
-          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
-        }
-
         // Only Pi sessions carry the loadout + resume command contract. Legacy
-        // entries predate the `runner` field and default to Pi.
+        // entries predate the `runner` field and default to Pi. Check this
+        // before the session file: non-Pi runners never create the placeholder
+        // `.jsonl`, so "session file is gone" would be misleading.
         const entryRunner = entry.runner ?? "pi";
         if (entryRunner !== "pi") {
           const err =
             `Subagent "${requestedName}" ran with the "${entryRunner}" CLI. ` +
             `Session resume is only supported for Pi subagents; spawn a fresh subagent instead.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        const sessionPath = entry.sessionFile;
+        if (!sessionPath || !existsSync(sessionPath)) {
+          const err =
+            `Subagent "${requestedName}" is registered but its session file is gone ` +
+            `(${sessionPath}). It cannot be resumed. Spawn a fresh subagent instead.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 

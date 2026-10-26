@@ -2,6 +2,15 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [3.10.6] - 2026-10-27
+
+### Fixed
+
+- **Non-Pi resume reports the real reason.** `subagent_message` checked whether the placeholder
+  session file existed before checking the runner, so a completed Claude/Codex subagent reported
+  "session file is gone" instead of "session resume is only supported for Pi subagents". The
+  runner check now comes first.
+
 ## [3.10.5] - 2026-10-27
 
 ### Fixed
