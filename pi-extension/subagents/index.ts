@@ -264,7 +264,11 @@ function resolveEffectiveInteractive(
 ): boolean {
   if (params.keepOpen != null) return params.keepOpen;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
-  return !(agentDefs?.autoExit ?? false);
+  // A runner-only spawn (`cli` with no agent profile) has nothing that opts
+  // into a persistent session, so it follows the documented `keepOpen: false`
+  // default: the pane auto-closes when the turn completes.
+  if (!agentDefs) return false;
+  return !(agentDefs.autoExit ?? false);
 }
 
 /**

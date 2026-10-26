@@ -2,6 +2,16 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [3.10.5] - 2026-10-27
+
+### Fixed
+
+- **Runner-only spawns auto-close by default.** `subagent({ cli: "claude", ... })` without an
+  agent profile was treated as interactive, so its pane stayed open after the task even though
+  `keepOpen` is documented as defaulting to `false`. A bare spawn now follows that default and
+  closes on completion; pass `keepOpen: true` (or use an agent profile) to keep it open. Agent
+  profiles without `auto-exit`/`interactive` retain their existing persistent behavior.
+
 ## [3.10.4] - 2026-10-27
 
 ### Fixed

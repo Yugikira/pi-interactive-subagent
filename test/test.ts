@@ -1287,9 +1287,14 @@ describe("subagent discovery", () => {
       testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, {}),
       true,
     );
-    // Bare spawn with no agent defs (e.g. /iterate fork) is interactive by default.
+    // A runner-only spawn has no profile to opt into a persistent session, so
+    // it follows the documented keepOpen default (false).
     assert.equal(
       testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null),
+      false,
+    );
+    assert.equal(
+      testApi.resolveEffectiveInteractive({ name: "A", task: "T", keepOpen: true }, null),
       true,
     );
   });
