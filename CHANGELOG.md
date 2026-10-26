@@ -2,6 +2,19 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [3.10.1] - 2026-10-26
+
+### Fixed
+
+- **Third-party model providers survive the child sandbox.** A Pi child launched with
+  `--no-extensions` had no `antigravity` (or other extension-installed) provider, so an inherited
+  parent model failed with `Model "antigravity/gemini-3.8-flash:low" not found` even though it
+  worked in the parent. The launch now discovers the matching provider package under the agent's
+  npm/git package directories and re-enables only its extension files alongside the tool sandbox.
+- **Windows fallback sentinel always carries an exit code.** When `pi` resolves to a PowerShell
+  function or shim, `$LASTEXITCODE` can be unset, producing `__SUBAGENT_DONE_` with no digits and
+  hiding the child's result. The script now falls back to `$?` and always emits a numeric code.
+
 ## [3.10.0] - 2026-10-26
 
 ### Changed

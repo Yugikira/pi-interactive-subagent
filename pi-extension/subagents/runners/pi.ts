@@ -2,8 +2,9 @@
  * Pi runner adapter: argv/env construction, sandbox replay, and result
  * extraction. This is the only place that knows how a Pi child is launched.
  */
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { getAgentConfigDir } from "../agents.ts";
 import { shellEscape } from "../shell.ts";
 import { getSessionId, readPiSession } from "../session.ts";
 import { getToolExtensionPath, SPAWNING_TOOLS } from "../tool-extensions.ts";
@@ -150,7 +151,15 @@ export function renderPiCommand(
       ([key, value]) => `$env:${key}=${escape(value)};`,
     );
     const cd = cwd ? `Set-Location ${escape(cwd)}; ` : "";
-    return `${cd}${envParts.join(" ")} & pi ${escapedArgs}; echo "__SUBAGENT_DONE_$LASTEXITCODE__"`;
+    // `pi` can resolve to a PowerShell shim (`pi.ps1`), after which
+    // $LASTEXITCODE is not guaranteed to be set. Capture `$?` too so the
+    // sentinel always carries a numeric code.
+    return (
+      `${cd}${envParts.join(" ")} & pi ${escapedArgs}; ` +
+      `$__piOk = $?; $__piCode = $LASTEXITCODE; ` +
+      `if ($null -eq $__piCode) { $__piCode = if ($__piOk) { 0 } else { 1 } }; ` +
+      `echo "__SUBAGENT_DONE_\${__piCode}__"`
+    );
   }
   const envParts = Object.entries(env).map(
     ([key, value]) => `${key}=${escape(value)}`,
@@ -199,7 +208,139 @@ export function buildPiResumeCommand(ctx: RunnerResumeContext): string {
   return renderPiCommand(ctx.platform, ctx.cwd ?? ctx.loadout.cwd, env, args);
 }
 
-export function buildPiLaunch(ctx: RunnerLaunchContext): LaunchPlan {
+const providerExtensionCache = new Map<string, string[]>();
+
+/** Providers Pi ships without extensions; no package discovery needed. */
+const BUILTIN_PROVIDERS = new Set([
+  "anthropic",
+  "openai",
+  "google",
+  "gemini",
+  "openrouter",
+  "deepseek",
+  "minimax-cn",
+  "xai",
+  "zai",
+  "groq",
+  "mistral",
+  "ollama",
+  "azure",
+  "bedrock",
+  "vertex",
+  "together",
+  "fireworks",
+  "cerebras",
+  "cohere",
+]);
+
+/** Provider part of a `provider/model` reference, or null for a bare model id. */
+export function providerFromModel(model: string | null | undefined): string | null {
+  if (!model) return null;
+  const slash = model.indexOf("/");
+  return slash > 0 ? model.slice(0, slash) : null;
+}
+
+function packageMatchesProvider(packageName: string, provider: string): boolean {
+  const base = packageName.split("/").pop() ?? packageName;
+  const wanted = `pi-${provider}`;
+  return base === wanted || base === provider || base.startsWith(`${wanted}-`);
+}
+
+/**
+ * Extension files that register a model provider.
+ *
+ * A child launched with `--no-extensions` has no third-party providers: a
+ * parent model inherited from `pi-antigravity` (or a similar provider
+ * extension) would fail with "Model ... not found" even though it works in
+ * the parent. We discover the provider package in the agent's npm directory
+ * and re-enable only its extension files, preserving the tool sandbox.
+ */
+function collectGitPackageDirs(root: string, depth: number): string[] {
+  if (depth < 0) return [];
+  const found: string[] = [];
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(root);
+  } catch {
+    return found;
+  }
+  for (const entry of entries) {
+    const dir = join(root, entry);
+    if (existsSync(join(dir, "package.json"))) {
+      found.push(dir);
+      continue;
+    }
+    found.push(...collectGitPackageDirs(dir, depth - 1));
+  }
+  return found;
+}
+
+export function providerExtensionPaths(
+  provider: string | null,
+  npmDir = join(getAgentConfigDir(), "npm", "node_modules"),
+  gitDir = join(getAgentConfigDir(), "git"),
+): string[] {
+  if (!provider) return [];
+  const normalized = provider.toLowerCase();
+  if (BUILTIN_PROVIDERS.has(normalized)) return [];
+
+  const key = `${npmDir}::${gitDir}::${normalized}`;
+  const cached = providerExtensionCache.get(key);
+  if (cached) return cached;
+
+  const result: string[] = [];
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(npmDir);
+  } catch {
+    entries = [];
+  }
+
+  const packageDirs: string[] = [];
+  for (const entry of entries) {
+    if (entry.startsWith("@")) {
+      const scopeDir = join(npmDir, entry);
+      try {
+        for (const sub of readdirSync(scopeDir)) {
+          if (packageMatchesProvider(sub, provider)) packageDirs.push(join(scopeDir, sub));
+        }
+      } catch {
+        // Unreadable scope; ignore.
+      }
+    } else if (packageMatchesProvider(entry, provider)) {
+      packageDirs.push(join(npmDir, entry));
+    }
+  }
+
+  // Git-installed packages live at git/<host>/<owner>/<repo>.
+  for (const dir of collectGitPackageDirs(gitDir, 2)) {
+    if (packageMatchesProvider(dir.split(/[\\/]/).pop() ?? "", provider)) {
+      packageDirs.push(dir);
+    }
+  }
+
+  for (const dir of packageDirs) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+      const extensions = Array.isArray(pkg?.pi?.extensions) ? pkg.pi.extensions : [];
+      for (const rel of extensions) {
+        if (typeof rel !== "string") continue;
+        const abs = resolve(dir, rel);
+        if (existsSync(abs) && !result.includes(abs)) result.push(abs);
+      }
+    } catch {
+      // A malformed package must not break every launch.
+    }
+  }
+
+  providerExtensionCache.set(key, result);
+  return result;
+}
+
+export function buildPiLaunch(
+  ctx: RunnerLaunchContext,
+  injectedProviderExtensions?: string[],
+): LaunchPlan {
   const rawArgs: string[] = [
     "--session",
     ctx.sessionFile,
@@ -212,6 +353,16 @@ export function buildPiLaunch(ctx: RunnerLaunchContext): LaunchPlan {
     name: ctx.displayName,
     escape: false,
   });
+
+  // `--no-extensions` also removes third-party model providers. If the
+  // resolved or inherited model belongs to one, re-enable just that provider
+  // extension so the child can resolve `--model`.
+  const provider = providerFromModel(ctx.model) ?? providerFromModel(ctx.parentModel);
+  const providerExtensions =
+    injectedProviderExtensions ?? providerExtensionPaths(provider);
+  for (const ext of providerExtensions) {
+    rawArgs.push("-e", ext);
+  }
 
   const taskArg = buildTaskArg(ctx);
   for (const promptArg of buildPiPromptArgs({

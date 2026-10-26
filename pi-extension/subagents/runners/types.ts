@@ -43,6 +43,8 @@ export interface RunnerLaunchContext {
   taskDelivery: "direct" | "artifact";
   cwd: string;
   model: string | null;
+  /** Parent session model (provider/id), used to find provider extensions. */
+  parentModel?: string | null;
   thinking: string | null;
   agentName: string | null;
   agent: RunnerAgentProfile | null;

@@ -1293,6 +1293,7 @@ async function launchSubagent(
     taskDelivery: launchBehavior.taskDelivery,
     cwd: targetCwdForSession,
     model: effectiveModel ?? null,
+    parentModel: formatParentModel(ctx.model),
     thinking: effectiveThinking ?? null,
     agentName: agentName ?? null,
     agent: agentDefs,

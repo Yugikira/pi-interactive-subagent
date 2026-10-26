@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   describeRunnerChoices,
@@ -11,7 +11,12 @@ import {
   listRunners,
   normalizeRunner,
 } from "../pi-extension/subagents/runners/registry.ts";
-import { piAdapter } from "../pi-extension/subagents/runners/pi.ts";
+import {
+  buildPiLaunch,
+  piAdapter,
+  providerExtensionPaths,
+  providerFromModel,
+} from "../pi-extension/subagents/runners/pi.ts";
 import { agyAdapter } from "../pi-extension/subagents/runners/agy.ts";
 import { claudeAdapter } from "../pi-extension/subagents/runners/claude.ts";
 import type {
@@ -128,6 +133,53 @@ describe("runner registry", () => {
   });
 });
 
+describe("runner provider extensions", () => {
+  it("extracts the provider from a provider/model reference", () => {
+    assert.equal(providerFromModel("antigravity/gemini-3.8-flash"), "antigravity");
+    assert.equal(providerFromModel("gemini-3.8-flash"), null);
+    assert.equal(providerFromModel(null), null);
+  });
+
+  it("re-enables a third-party provider extension under --no-extensions", () => {
+    const npmDir = join(dir, "npm", "node_modules");
+    const gitDir = join(dir, "git");
+    const pkgDir = join(npmDir, "pi-antigravity");
+    const extPath = join(pkgDir, "src", "index.ts");
+    mkdirSync(dirname(extPath), { recursive: true });
+    writeFileSync(
+      join(pkgDir, "package.json"),
+      JSON.stringify({ name: "pi-antigravity", pi: { extensions: ["./src/index.ts"] } }),
+    );
+    writeFileSync(extPath, "");
+
+    assert.deepEqual(providerExtensionPaths("antigravity", npmDir, gitDir), [extPath]);
+    assert.deepEqual(providerExtensionPaths("antigravity", npmDir, gitDir), [extPath], "cached");
+    assert.deepEqual(providerExtensionPaths("anthroppic", npmDir, gitDir), []);
+
+    // Built-in providers never scan packages, even if a similarly named
+    // extension exists (e.g. a `pi-google` search extension).
+    const googlePkg = join(npmDir, "pi-google");
+    mkdirSync(join(googlePkg, "src"), { recursive: true });
+    writeFileSync(
+      join(googlePkg, "package.json"),
+      JSON.stringify({ name: "pi-google", pi: { extensions: ["./src/index.ts"] } }),
+    );
+    writeFileSync(join(googlePkg, "src", "index.ts"), "");
+    assert.deepEqual(providerExtensionPaths("google", npmDir, gitDir), []);
+
+    // Git-installed packages are discovered under git/<host>/<owner>/<repo>.
+    const repoDir = join(gitDir, "github.com", "acme", "pi-stealth");
+    const gitExt = join(repoDir, "src", "index.ts");
+    mkdirSync(dirname(gitExt), { recursive: true });
+    writeFileSync(
+      join(repoDir, "package.json"),
+      JSON.stringify({ name: "pi-stealth", pi: { extensions: ["./src/index.ts"] } }),
+    );
+    writeFileSync(gitExt, "");
+    assert.deepEqual(providerExtensionPaths("stealth", npmDir, gitDir), [gitExt]);
+  });
+});
+
 describe("pi adapter launch plan", () => {
   it("builds raw argv for herdr agent start", () => {
     const plan = piAdapter.buildLaunch(
@@ -159,6 +211,21 @@ describe("pi adapter launch plan", () => {
       plan.startArgs.some((arg) => arg.replace(/\\/g, "/").endsWith("subagents/index.ts")),
       "expected the spawning-tool extension path",
     );
+  });
+
+  it("loads the model provider extension alongside the tool sandbox", () => {
+    const plan = buildPiLaunch(
+      makeCtx({
+        model: "antigravity/gemini-3.8-flash",
+        loadout: { ...emptyLoadout, toolAllowlist: "read" },
+      }),
+      ["/ext/pi-antigravity/index.ts"],
+    );
+
+    assert.ok(plan.startArgs.includes("--no-extensions"));
+    const index = plan.startArgs.indexOf("/ext/pi-antigravity/index.ts");
+    assert.ok(index > 0);
+    assert.equal(plan.startArgs[index - 1], "-e");
   });
 
   it("carries the spawn allowlist and agent dir in the pane env", () => {
@@ -213,7 +280,9 @@ describe("pi adapter launch plan", () => {
         "$env:PI_SUBAGENT_ACTIVITY_FILE='C:\\art\\a.json'; " +
         "$env:PI_SUBAGENT_AGENT='scout'; " +
         "& pi '--session' 'C:\\art\\s.jsonl' '-e' 'C:\\p\\subagent-done.ts' 'full task'; " +
-        'echo "__SUBAGENT_DONE_$LASTEXITCODE__"',
+        '$__piOk = $?; $__piCode = $LASTEXITCODE; ' +
+        'if ($null -eq $__piCode) { $__piCode = if ($__piOk) { 0 } else { 1 } }; ' +
+        'echo "__SUBAGENT_DONE_${__piCode}__"',
     );
   });
 });
