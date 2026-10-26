@@ -1,5 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { writeJsonAtomic } from "./signals.ts";
 
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
 export type SubagentActivityScope = "agent" | "turn" | "provider" | "streaming" | "tool";
@@ -199,23 +201,32 @@ export function readSubagentActivityFile(
   return validateActivity(parsed, expectedRunningChildId);
 }
 
-export function writeSubagentActivityFile(activityFile: string, activity: SubagentActivityState): void {
-  const dir = dirname(activityFile);
-  mkdirSync(dir, { recursive: true });
-  const tempFile = join(dir, `${activity.runningChildId}.json.${process.pid}.${activity.sequence}.tmp`);
-
+/** Async activity read for the 1 Hz monitor. */
+export async function readSubagentActivityFileAsync(
+  activityFile: string,
+  expectedRunningChildId: string,
+): Promise<ActivityReadResult> {
+  let raw: string;
   try {
-    writeFileSync(tempFile, `${JSON.stringify(activity)}\n`, "utf8");
-    renameSync(tempFile, activityFile);
+    raw = await readFile(activityFile, "utf8");
   } catch (error) {
-    try {
-      unlinkSync(tempFile);
-    } catch (cleanupError) {
-      // Temp cleanup is best effort; preserve the original write/rename failure
-      void cleanupError;
-    }
-    throw error;
+    const errno = error as NodeJS.ErrnoException;
+    if (errno.code === "ENOENT") return { ok: false, reason: "missing" };
+    return { ok: false, reason: "invalid", error: errno.message };
   }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, reason: "invalid", error: message };
+  }
+  return validateActivity(parsed, expectedRunningChildId);
+}
+
+export function writeSubagentActivityFile(activityFile: string, activity: SubagentActivityState): void {
+  writeJsonAtomic(activityFile, activity);
 }
 
 function createNoopRecorder(): SubagentActivityRecorder {

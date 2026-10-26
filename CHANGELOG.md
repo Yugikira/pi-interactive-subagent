@@ -2,6 +2,51 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [3.10.0] - 2026-10-26
+
+### Changed
+
+- **Architecture: runner adapters, async monitor, and typed signals.** Runner knowledge is now
+  behind one adapter per CLI (`runners/`), with a registry that generates the `cli` schema and
+  `subagents_list` output. `herdr.ts` is a pure mux adapter again.
+- **One async observation loop.** A single monitor polls pane state, activity, signals, and
+  questions once per second with an in-flight guard. It replaces the synchronous status interval
+  and the watcher's `onTick`, so the Pi UI is no longer blocked by `execFileSync` on the hot path.
+- **Completion is a pure reducer.** Sidecar freshness, idle settling, pane-loss grace, and stall
+  policy live in `completion.ts`; the monitor feeds it observations. Stalls notify by default and
+  do not settle the turn, so a late result is never lost.
+- **Atomic, typed signals.** `.exit`, `.parked`, `.ask`, loadouts, and the name registry share
+  `signals.ts` (temp+rename writes, validate-before-consume, bounded poison-file reaping).
+- **Model resolution.** Bundled agents are provider-neutral. Precedence: explicit > frontmatter >
+  `models.agents.<name>` > `PI_SUBAGENT_DEFAULT_MODEL` > `models.default` > parent model.
+- **Config.** One lazily loaded `config.json` (`PI_SUBAGENT_CONFIG` supported) with `status` and
+  `models`; `status.lineLimit` is now honored.
+- **Pane layout.** `PI_SUBAGENT_LAYOUT` supports `right` (default), `split` (smart tiling),
+  `split:down`, and `tab`.
+
+### Added
+
+- **`subagent_interrupt` (Pi only):** send Escape to the active turn without closing the pane or
+  session. See `docs/adr/0001-pi-only-interrupt.md`.
+- **Pi session resume by name** is explicitly Pi-only; other runners return a clear error.
+- **`npm run typecheck`** and a shared `tsconfig.json`.
+- **`GLOSSARY.md`** and ADRs under `docs/adr/`.
+
+### Fixed
+
+- `keepOpen` no longer auto-exits the Pi child: `PI_SUBAGENT_AUTO_EXIT` follows the effective
+  (keepOpen-aware) value.
+- `PI_SUBAGENT_ALLOWED` and `PI_CODING_AGENT_DIR` are now present on the normal `startAgent`
+  path, so nested-spawn restrictions and the resolved agent dir are not lost.
+- Stale `active` activity snapshots now age into `stalled` after 60 s instead of showing
+  `active` forever.
+- Consumers validate a signal before deleting it; a partial write is retried, not lost.
+- `session_shutdown` only clears the subagents spawned by that session, and name-based control
+  operations are scoped to the calling session.
+- Explicit duplicate names are auto-suffixed like defaulted names.
+- Removed the unreachable Claude sentinel/transcript-copy path and the unused `PI_DENY_TOOLS`
+  handling.
+
 ## [3.9.0] - 2026-10-03
 
 ### Fixed

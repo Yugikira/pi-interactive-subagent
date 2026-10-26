@@ -1,8 +1,7 @@
 ---
 name: researcher
-description: Web researcher using Antigravity CLI (agy) — searches the web and synthesizes findings
+description: Web researcher — searches the web and synthesizes findings
 cli: pi
-model: gemini-3.8-flash
 thinking: medium
 system-prompt: append
 auto-exit: true

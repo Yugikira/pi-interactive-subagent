@@ -899,7 +899,7 @@ describe("status.ts", () => {
     assert.equal(stalled.statusLabel, null);
   });
 
-  it("classifies active snapshots without aging into stalled", () => {
+  it("ages an active snapshot into stalled after the watchdog threshold", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, {
       snapshot: "present",
@@ -913,10 +913,14 @@ describe("status.ts", () => {
       latestEvent: "tool_execution_start",
     }, 5_000);
 
-    const snapshot = classifyStatus(state, 240_000);
-    assert.equal(snapshot.kind, "active");
-    assert.equal(snapshot.activityLabel, "bash");
-    assert.equal(snapshot.activeDurationText, "3m");
+    const fresh = classifyStatus(state, 10_000);
+    assert.equal(fresh.kind, "active");
+    assert.equal(fresh.activityLabel, "bash");
+    assert.equal(fresh.activeDurationText, "5s");
+
+    const stale = classifyStatus(state, 65_000);
+    assert.equal(stale.kind, "stalled");
+    assert.equal(stale.statusLabel, "stale activity");
   });
 
   it("classifies waiting snapshots as healthy idle without becoming stalled", () => {
@@ -2278,11 +2282,11 @@ describe("tool registration", () => {
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
   });
 
-  it("no longer registers subagent_interrupt or subagent_resume", () => {
+  it("registers a Pi-only subagent_interrupt and no subagent_resume", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const names = registeredTools.map((tool) => tool.name);
-    assert.equal(names.includes("subagent_interrupt"), false);
+    assert.equal(names.includes("subagent_interrupt"), true);
     assert.equal(names.includes("subagent_resume"), false);
   });
 
@@ -2547,13 +2551,83 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_message and not the old interrupt/resume tools", () => {
+  it("registers subagent_message and subagent_interrupt, not the old resume tool", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const names = registeredTools.map((tool) => tool.name);
     assert.equal(names.includes("subagent_message"), true);
-    assert.equal(names.includes("subagent_interrupt"), false);
+    assert.equal(names.includes("subagent_interrupt"), true);
     assert.equal(names.includes("subagent_resume"), false);
+  });
+
+  it("interrupts a running Pi subagent with Escape and marks it waiting", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      const running = makeRunning({
+        id: "a1",
+        name: "Worker",
+        surface: "a1",
+        cli: "pi",
+        herdrAgentName: "worker",
+      });
+      runningMap.set("a1", running);
+      const sent: string[] = [];
+
+      const result = testApi.handleSubagentInterrupt(
+        { name: "Worker" },
+        (target: any) => sent.push(target.surface),
+      );
+
+      assert.deepEqual(sent, ["a1"]);
+      assert.equal(result.details.status, "interrupt_requested");
+      assert.equal(running.statusState.currentKind, "waiting");
+      assert.equal(running.statusState.activityLabel, "interrupted");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("refuses to interrupt a non-Pi subagent", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      runningMap.set(
+        "a1",
+        makeRunning({ id: "a1", name: "Claude", surface: "a1", cli: "claude" }),
+      );
+      let sent = 0;
+
+      const result = testApi.handleSubagentInterrupt(
+        { name: "Claude" },
+        () => {
+          sent++;
+        },
+      );
+
+      assert.equal(sent, 0);
+      assert.match(result.content[0].text, /only supported for Pi subagents/);
+      assert.ok(result.details.error);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("claims a turn result once even with overlapping watchers", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running: any = makeRunning();
+
+    // No per-turn record yet: deliver (this is the error path).
+    assert.equal(testApi.claimDelivery(running), true);
+
+    running.delivery = { turn: 1, state: "pending" };
+    assert.equal(testApi.claimDelivery(running), true);
+    assert.equal(running.delivery.state, "delivered");
+    assert.equal(testApi.claimDelivery(running), false);
   });
 
   it("resolves a running subagent by exact name and reports ambiguity", () => {
