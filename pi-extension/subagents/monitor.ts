@@ -54,6 +54,8 @@ export interface MonitorDeps {
     pane: PaneInspection,
   ): boolean | undefined;
   deliverQuestion(entry: MonitorEntry, ask: AskSignal): void;
+  /** A pane reported a new or changed native session id. */
+  onSessionId?(entry: MonitorEntry, sessionId: string, previous: string | undefined): void;
   /** Batched so one tick produces at most one aggregate status message. */
   onTransitions(
     transitions: Array<{
@@ -86,12 +88,13 @@ export function inspectEntry(
   if (panes === null) {
     return { kind: "unavailable", error: "pane inventory unavailable" };
   }
-  // Prefer the agent registration, but fall back to the pane id: a freshly
-  // created pane exists before Herdr lists its agent, and that window must not
-  // look like "the pane was closed".
-  const pane =
-    panes.find((candidate) => candidate.agent === entry.herdrAgentName) ??
-    panes.find((candidate) => candidate.paneId === entry.surface);
+  // The surface id is the entry's identity. Do NOT match by agent name: Herdr
+  // reports the runner *kind* ("pi", "claude") for every pane of that runner,
+  // so a child named "pi" would otherwise inspect the orchestrator's pane and
+  // read the wrong completion/output. A just-created pane is already present in
+  // the inventory with its pane id, so the "agent not listed yet" window is
+  // still handled.
+  const pane = panes.find((candidate) => candidate.paneId === entry.surface);
   if (!pane) return { kind: "missing" };
   return {
     kind: "present",
@@ -187,9 +190,16 @@ export async function runMonitorTick(
       const pane = inspectEntry(entry, panes);
       // The pane inventory already carries the runner's native session id.
       // Cache it now so result extraction does not depend on a separate
-      // `agent get` that can time out while Herdr is busy.
-      if (pane.kind === "present" && pane.sessionId && !entry.sessionId) {
-        entry.sessionId = pane.sessionId;
+      // `agent get` that can time out while Herdr is busy. Non-Pi ids may
+      // change on resume (`--fork-session`), so update those on change too;
+      // Pi keeps its canonical header id.
+      if (pane.kind === "present" && pane.sessionId) {
+        const previous = entry.sessionId;
+        const changed = pane.sessionId !== previous;
+        if (!previous || (adapter.id !== "pi" && changed)) {
+          entry.sessionId = pane.sessionId;
+          if (changed) deps.onSessionId?.(entry, pane.sessionId, previous);
+        }
       }
       const activityRead = entry.activityFile
         ? await deps.readActivity(entry.activityFile, entry.id)

@@ -1,6 +1,6 @@
 /** Google Antigravity CLI adapter. */
 import { readRunnerSession } from "../session.ts";
-import { buildCommonEnv } from "./launch-env.ts";
+import { buildCommonEnv, buildResumeEnv } from "./launch-env.ts";
 import type { RunnerAdapter } from "./types.ts";
 
 export const agyAdapter: RunnerAdapter = {
@@ -12,7 +12,7 @@ export const agyAdapter: RunnerAdapter = {
   nativeTranscriptFreshness: true,
   hasActivitySnapshots: false,
   supportsTurnInterrupt: false,
-  supportsResume: false,
+  supportsResume: true,
   supportsSessionStats: false,
 
   buildLaunch(ctx) {
@@ -23,6 +23,18 @@ export const agyAdapter: RunnerAdapter = {
       startArgs: args,
       env: buildCommonEnv(ctx),
       prompt: ctx.task,
+    };
+  },
+
+  buildResume(ctx) {
+    if (!ctx.sessionId || !ctx.launchArgs) return null;
+    return {
+      mode: "agent",
+      // Replay the original model/effort flags alongside the conversation.
+      startArgs: ["--conversation", ctx.sessionId, ...ctx.launchArgs],
+      env: buildResumeEnv(ctx),
+      prompt: ctx.message,
+      cwd: ctx.cwd ?? process.cwd(),
     };
   },
 

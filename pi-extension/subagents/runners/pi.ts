@@ -181,17 +181,23 @@ export function renderPiFallbackCommand(
  * Build the resume command for a finished Pi session. Replays the sandbox from
  * the loadout and appends the follow-up message file.
  */
-export function buildPiResumeCommand(ctx: RunnerResumeContext): string {
+export function buildPiResumeCommand(ctx: RunnerResumeContext): string | null {
+  const loadout = ctx.loadout;
+  if (!loadout) return null;
+
   const args: string[] = [
     "--session",
     ctx.sessionFile,
     "-e",
     ctx.subagentDonePath,
   ];
-  applySandboxToParts(args, ctx.loadout, {
+  // `renderPiCommand` escapes each argv entry; escaping here as well produces
+  // values like "'model'" and a resumed Pi rejects the model id.
+  applySandboxToParts(args, loadout, {
     artifactDir: ctx.artifactDir,
     name: ctx.name,
     platform: ctx.platform,
+    escape: false,
   });
   if (ctx.messageFile) args.push(`@${ctx.messageFile}`);
 
@@ -200,12 +206,12 @@ export function buildPiResumeCommand(ctx: RunnerResumeContext): string {
     id: ctx.id,
     sessionFile: ctx.sessionFile,
     activityFile: ctx.activityFile,
-    agentName: ctx.loadout.agent,
+    agentName: loadout.agent,
     autoExit: ctx.autoExit,
     agentDir: ctx.agentDir,
     spawnable: ctx.spawnable,
   });
-  return renderPiCommand(ctx.platform, ctx.cwd ?? ctx.loadout.cwd, env, args);
+  return renderPiCommand(ctx.platform, ctx.cwd ?? loadout.cwd, env, args);
 }
 
 const providerExtensionCache = new Map<string, string[]>();
@@ -400,11 +406,19 @@ export const piAdapter: RunnerAdapter = {
   supportsSessionStats: true,
 
   buildLaunch: buildPiLaunch,
-  buildResume: buildPiResumeCommand,
+  buildResume(ctx) {
+    const command = buildPiResumeCommand(ctx);
+    if (!command) return null;
+    return {
+      mode: "shell",
+      command,
+      cwd: ctx.cwd ?? ctx.loadout?.cwd ?? undefined,
+    };
+  },
 
   extractResult(ctx: RunnerResultContext) {
     try {
-      const summary = readPiSession(ctx.sessionFile, 0);
+      const summary = readPiSession(ctx.sessionFile, ctx.afterLine ?? 0);
       if (!summary) return null;
       const sessionId = getSessionId(ctx.sessionFile);
       return sessionId ? { summary, sessionId } : { summary };

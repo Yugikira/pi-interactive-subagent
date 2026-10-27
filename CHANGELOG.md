@@ -2,6 +2,50 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [4.0.0] - 2026-10-27
+
+### Added
+
+- **Claude Code and Agy subagents can be resumed by name.** `subagent_message({ name, message })`
+  on a finished or stopped Claude/Agy subagent creates a new pane and relaunches the runner against
+  its existing native session (`claude --resume <uuid>` / `agy --conversation <id>`), replaying the
+  original model, permissions, and identity flags. Only the new turn's result is delivered through
+  the normal `subagent_result` steer. A missing native session id or launch metadata returns a clear
+  “spawn a fresh subagent” error. Pi keeps its existing `pi --session <file>` shell transport.
+- **Native session metadata is persisted in the name registry.** Spawn captures the id from the
+  Herdr readiness poll, the 1 Hz monitor fills late discoveries, and the watcher covers short-lived
+  agents. The registry now also stores `cwd` and non-Pi `launchArgs`, and later updates merge rather
+  than overwrite those fields.
+
+### Changed
+
+- **The extension entrypoint is now a composition root (breaking internal layout).** Launch, turn
+  watching/delivery, controls, monitor hosting, formatting, widget rendering, commands, and tool
+  registration live in focused modules; `pi-extension/subagents/index.ts` shrank from 3,140 to
+  ~220 lines. The registered tool names, parameters, and user-facing behavior are unchanged, but
+  external code that imported internals from `index.ts` must use the new modules or the `__test__`
+  surface.
+
+### Fixed
+
+- **A subagent's completion is read from its own pane, not a same-kind sibling.** Herdr reports the
+  runner *kind* (`pi`, `claude`, …) for every pane, not the custom agent name. The monitor matched
+  entries by agent name first, so a runner-only child named `pi` could inspect the orchestrator's
+  own Pi pane. That made the orchestrator see the parent's terminal banner, or settle the child
+  prematurely when the parent was `done`, and kill it before it wrote its session. Running entries
+  are now identified by their surface id, and result fallbacks read that surface rather than
+  resolving the agent by name.
+- **Pi resume replays the model without double-escaping it.** The resume command escaped the
+  sandbox argv and then escaped the rendered command again, so a model id arrived as
+  `'minimax-cn/…'` and Pi exited 1. Sandbox args are now left raw for the single renderer, and a
+  regression test pins it.
+- **Agy's slow start no longer races the first prompt.** `herdr agent start` can return on a
+  readiness timeout while Agy is still registering its prompt target, so `agent prompt` failed with
+  `agent_not_found` and the orchestrator retried too fast. Agy now gets a 20s start window, and the
+  extension waits for the named agent to report `idle`/`working` before prompting (20s readiness
+  deadline), with a short `agent_not_found` retry. Claude and Agy spawn/resume were verified live
+  against the real CLIs.
+
 ## [3.10.8] - 2026-10-27
 
 ### Fixed

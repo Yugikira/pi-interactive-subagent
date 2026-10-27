@@ -22,6 +22,7 @@ import { claudeAdapter } from "../pi-extension/subagents/runners/claude.ts";
 import type {
   RunnerLaunchContext,
   RunnerResultContext,
+  RunnerResumeContext,
 } from "../pi-extension/subagents/runners/types.ts";
 import type { SubagentLoadout } from "../pi-extension/subagents/signals.ts";
 
@@ -85,6 +86,28 @@ function makeResultCtx(overrides: Partial<RunnerResultContext> = {}): RunnerResu
     turnStartTime: 0,
     agentName: "scout",
     readPane: () => "",
+    ...overrides,
+  };
+}
+
+function makeResumeCtx(overrides: Partial<RunnerResumeContext> = {}): RunnerResumeContext {
+  return {
+    platform: "linux",
+    sessionFile: join(dir, "session.jsonl"),
+    sessionId: "native-session-1",
+    launchArgs: ["--dangerously-skip-permissions", "--model", "test-model"],
+    name: "scout",
+    id: "abc123",
+    message: "continue",
+    messageFile: null,
+    loadout: emptyLoadout,
+    autoExit: true,
+    agentDir: null,
+    spawnable: null,
+    cwd: dir,
+    artifactDir: join(dir, "art"),
+    activityFile: join(dir, "activity.json"),
+    subagentDonePath: "/p/subagent-done.ts",
     ...overrides,
   };
 }
@@ -361,5 +384,75 @@ describe("claude adapter launch plan", () => {
     const index = plan.startArgs.indexOf("--model");
     assert.ok(index >= 0);
     assert.equal(plan.startArgs[index + 1], "claude-sonnet-5-5");
+  });
+});
+
+describe("runner resume plans", () => {
+  it("marks Pi, Claude, and Agy resumable; protocol runners not", () => {
+    assert.equal(piAdapter.supportsResume, true);
+    assert.equal(claudeAdapter.supportsResume, true);
+    assert.equal(agyAdapter.supportsResume, true);
+    assert.equal(getRunner("codex")!.supportsResume, false);
+  });
+
+  it("builds a shell plan for Pi without changing the command builder", () => {
+    const plan = piAdapter.buildResume!(makeResumeCtx());
+    if (!plan || plan.mode !== "shell") throw new Error("expected a shell plan");
+    assert.match(plan.command, /--session/);
+    assert.equal(plan.cwd, dir);
+    assert.equal(piAdapter.buildResume!(makeResumeCtx({ loadout: null })), null);
+  });
+
+  it("builds a Claude agent plan with --resume and the original argv", () => {
+    const identity = join(dir, "identity.md");
+    writeFileSync(identity, "identity");
+    const launchArgs = [
+      "--dangerously-skip-permissions",
+      "--model",
+      "claude-sonnet-5-5",
+      "--append-system-prompt-file",
+      identity,
+    ];
+    const plan = claudeAdapter.buildResume!(makeResumeCtx({ launchArgs }));
+    if (!plan || plan.mode !== "agent") throw new Error("expected an agent plan");
+    assert.deepEqual(plan.startArgs, ["--resume", "native-session-1", ...launchArgs]);
+    assert.equal(plan.prompt, "continue");
+    assert.equal(plan.env.PI_SUBAGENT_NAME, "scout");
+  });
+
+  it("refuses a Claude resume when the identity file is gone", () => {
+    const launchArgs = ["--append-system-prompt-file", join(dir, "missing.md")];
+    assert.equal(claudeAdapter.buildResume!(makeResumeCtx({ launchArgs })), null);
+  });
+
+  it("builds an Agy agent plan with --conversation and replayed model/effort", () => {
+    const launchArgs = [
+      "--dangerously-skip-permissions",
+      "--model",
+      "gemini-x",
+      "--effort",
+      "high",
+    ];
+    const plan = agyAdapter.buildResume!(makeResumeCtx({ launchArgs, sessionId: "conv-9" }));
+    if (!plan || plan.mode !== "agent") throw new Error("expected an agent plan");
+    assert.deepEqual(plan.startArgs, ["--conversation", "conv-9", ...launchArgs]);
+    assert.equal(plan.prompt, "continue");
+  });
+
+  it("refuses resume without a native id or launch argv", () => {
+    assert.equal(claudeAdapter.buildResume!(makeResumeCtx({ sessionId: null })), null);
+    assert.equal(agyAdapter.buildResume!(makeResumeCtx({ launchArgs: null })), null);
+  });
+
+  it("replays the Pi resume model without double-escaping it", () => {
+    const plan = piAdapter.buildResume!(
+      makeResumeCtx({
+        platform: "win32",
+        loadout: { ...emptyLoadout, model: "minimax-cn/MiniMax-3.1-Flash" },
+      }),
+    );
+    if (!plan || plan.mode !== "shell") throw new Error("expected a shell plan");
+    assert.match(plan.command, /--model/);
+    assert.doesNotMatch(plan.command, /''|"'/);
   });
 });

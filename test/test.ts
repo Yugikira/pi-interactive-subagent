@@ -87,6 +87,8 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
+import { createFakeHerdr, herdrError, useEmptyFakeHerdr } from "./fake-herdr.ts";
+import { stopMonitor } from "../pi-extension/subagents/monitor-host.ts";
 
 // --- Helpers ---
 
@@ -104,98 +106,6 @@ function makeRunning(overrides: Record<string, unknown> = {}) {
   };
 }
 
-
-// ── Fake herdr ──
-//
-// The suite may itself run inside a Herdr pane, where `HERDR_ENV=1` makes the
-// real CLI reachable. Every termination test therefore installs this fake
-// through `setHerdrExecDeps`, so nothing touches the developer's real panes.
-
-interface FakePane {
-  /** `herdr pane close` rejects for this pane. */
-  closeFails?: boolean;
-  /** Registered agent name, as `pane list` would report it. */
-  agent?: string;
-}
-
-function herdrError(code: string, message: string): string {
-  return `Command failed: herdr\n{"error":{"code":"${code}","message":"${message}"}}`;
-}
-
-/** Scripted stand-in for the herdr CLI, covering only what the stop path uses. */
-function createFakeHerdr(
-  initial: Record<string, FakePane>,
-  options?: { paneListFailsTimes?: number; keyWriteFails?: boolean; agentNames?: string[] },
-) {
-  const panes = new Map<string, FakePane>(Object.entries(initial));
-  const agentNames = new Set(options?.agentNames ?? []);
-  const calls: string[][] = [];
-  const keyWrites: string[][] = [];
-  let paneListFailures = options?.paneListFailsTimes ?? 0;
-
-  const run = (args: string[]): string => {
-      calls.push(args);
-      const [group, verb] = args;
-
-      // The authoritative inventory. A failure here must surface as "cannot
-      // tell" — never as "the pane is gone".
-      if (group === "pane" && verb === "list") {
-        if (paneListFailures > 0) {
-          paneListFailures -= 1;
-          throw new Error(herdrError("internal_error", "pane inventory unavailable"));
-        }
-        return JSON.stringify({
-          result: {
-            panes: Array.from(panes.entries()).map(([paneId, pane]) => ({
-              pane_id: paneId,
-              ...(pane.agent ? { agent: pane.agent } : {}),
-            })),
-          },
-        });
-      }
-
-      if (group === "pane" && verb === "close") {
-        const paneId = args[2];
-        const pane = panes.get(paneId);
-        if (!pane) throw new Error(herdrError("pane_not_found", `pane ${paneId} not found`));
-        if (pane.closeFails) {
-          throw new Error(herdrError("pane_close_failed", `pane ${paneId} could not be closed`));
-        }
-        panes.delete(paneId);
-        return JSON.stringify({ result: {} });
-      }
-
-      if ((group === "agent" || group === "pane") && verb === "send-keys") {
-        if (options?.keyWriteFails) {
-          throw new Error(herdrError("invalid_key", "unsupported key"));
-        }
-        if (group === "agent" && !agentNames.has(args[2])) {
-          throw new Error(herdrError("agent_not_found", `agent target ${args[2]} not found`));
-        }
-        keyWrites.push([`${group}:${args[2]}`, ...args.slice(3)]);
-        return JSON.stringify({ result: {} });
-      }
-
-      throw new Error(herdrError("invalid_request", `unhandled fake call: ${args.join(" ")}`));
-  };
-
-  const deps = {
-    available: () => true,
-    run,
-    runAsync: async (args: string[]) => run(args),
-  };
-
-  return { panes, calls, keyWrites, deps };
-}
-
-/**
- * Install an empty fake herdr world so a stop is deterministic in any
- * environment: every surface reads as "confirmed absent" rather than depending
- * on whether the suite happens to run inside a real Herdr pane.
- */
-function useEmptyFakeHerdr(): () => void {
-  return setHerdrExecDeps(createFakeHerdr({}).deps);
-}
 
 function createTestDir(): string {
   return mkdtempSync(join(tmpdir(), "subagents-test-"));
@@ -356,6 +266,28 @@ const TOOL_RESULT = {
 };
 
 // --- Tests ---
+
+describe("__test__ surface", () => {
+  it("keeps the internal contract used by the suite", () => {
+    const testApi = (subagentsModule as any).__test__;
+    for (const key of [
+      "runningSubagents",
+      "reservedNames",
+      "launchSubagent",
+      "paneShowsAgent",
+      "handleSubagentSteer",
+      "stopSubagentByName",
+      "stopCompletedByName",
+      "uniqueRunningName",
+      "resolveResumeLaunchBehavior",
+      "renderSubagentWidgetLines",
+      "borderLine",
+      "claimDelivery",
+    ]) {
+      assert.ok(key in testApi, `missing __test__.${key}`);
+    }
+  });
+});
 
 describe("session.ts", () => {
   let dir: string;
@@ -2300,7 +2232,7 @@ describe("tool registration", () => {
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
   });
 
-  it("reports Pi-only resume for a completed non-Pi subagent whose placeholder session file is absent", async () => {
+  it("reports missing launch arguments for a non-Pi entry before checking the placeholder session file", async () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const testApi = (subagentsModule as any).__test__;
@@ -2331,8 +2263,9 @@ describe("tool registration", () => {
         undefined,
         ctx,
       );
-      assert.match(res.content[0].text, /only supported for Pi subagents/);
+      assert.match(res.content[0].text, /no recorded launch arguments/);
       assert.doesNotMatch(res.content[0].text, /session file is gone/);
+      assert.doesNotMatch(res.content[0].text, /only supported for Pi subagents/);
     } finally {
       rmSync(sessionDir, { recursive: true, force: true });
       testApi.runningSubagents.clear();
@@ -3106,6 +3039,29 @@ describe("subagent interruption", () => {
         const message = testApi.stopSubagentByName("scout", undefined, artifactDir);
         assert.match(message, /now belongs to "other-agent"/);
         assert.equal(world.panes.has("pane-9"), true);
+      } finally {
+        restore();
+        rmSync(artifactDir, { recursive: true, force: true });
+      }
+    });
+
+    it("closes a leftover pane when the inventory reports the runner kind, not the custom name", () => {
+      const testApi = (subagentsModule as any).__test__;
+      testApi.runningSubagents.clear();
+      const artifactDir = createTestDir();
+      registerName(artifactDir, "claude-bot", {
+        sessionFile: join(artifactDir, "placeholder.jsonl"),
+        sessionId: "claude-1",
+        runner: "claude",
+        surface: "pane-9",
+        herdrAgentName: "claude-bot",
+      });
+      const world = createFakeHerdr({ "pane-9": { agent: "claude" } });
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const message = testApi.stopSubagentByName("claude-bot", undefined, artifactDir);
+        assert.match(message, /stopped/);
+        assert.equal(world.panes.has("pane-9"), false);
       } finally {
         restore();
         rmSync(artifactDir, { recursive: true, force: true });
@@ -4150,6 +4106,74 @@ describe("herdr.ts", () => {
       const subagentsDir = join(fileURLToPath(import.meta.url), "../../pi-extension/subagents");
       const subagentDonePath = join(subagentsDir, "subagent-done.ts");
       assert.equal(existsSync(subagentDonePath), true, `Expected ${subagentDonePath} to exist`);
+    });
+  });
+
+  describe("spawn resume metadata", () => {
+    it("persists the native session id, cwd, and launch argv at spawn", async () => {
+      await withIsolatedAgentEnv(async () => {
+        const prevDelay = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+        const prevPane = process.env.HERDR_PANE_ID;
+        process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+        process.env.HERDR_PANE_ID = "caller-pane";
+
+        const world = createFakeHerdr(
+          {},
+          { agentSessionIds: { "spawn-bot": "native-spawn-1" } },
+        );
+        const restoreHerdr = setHerdrExecDeps(world.deps);
+        const sessionDir = createTestDir();
+        const parentId = "spawn-parent";
+        const testApi = (subagentsModule as any).__test__;
+        testApi.runningSubagents.clear();
+
+        try {
+          const { api, registeredTools } = createMockExtensionApi();
+          (subagentsModule as any).default(api);
+          const tool = registeredTools.find((candidate: any) => candidate.name === "subagent");
+          assert.ok(tool, "expected subagent tool");
+
+          const ctx = {
+            sessionManager: {
+              getSessionFile: () => join(sessionDir, "parent.jsonl"),
+              getSessionId: () => parentId,
+              getSessionDir: () => sessionDir,
+            },
+            cwd: process.cwd(),
+            model: null,
+          };
+
+          const result = await tool.execute(
+            "call-spawn",
+            { cli: "claude", task: "do it", name: "spawn-bot" },
+            undefined,
+            undefined,
+            ctx,
+          );
+
+          assert.equal(result.details.status, "started");
+          const artifactDir = join(sessionDir, "artifacts", parentId);
+          const entry = readNameRegistry(artifactDir)["spawn-bot"];
+          assert.ok(entry, "expected the name registry entry");
+          assert.equal(entry.runner, "claude");
+          assert.equal(entry.sessionId, "native-spawn-1");
+          assert.equal(entry.cwd, process.cwd());
+          assert.deepEqual(entry.launchArgs, ["--dangerously-skip-permissions"]);
+
+          for (const running of testApi.runningSubagents.values()) {
+            running.abortController?.abort();
+          }
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        } finally {
+          stopMonitor();
+          testApi.runningSubagents.clear();
+          testApi.reservedNames.clear();
+          restoreHerdr();
+          restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", prevDelay);
+          restoreEnvVar("HERDR_PANE_ID", prevPane);
+          rmSync(sessionDir, { recursive: true, force: true });
+        }
+      });
     });
   });
 

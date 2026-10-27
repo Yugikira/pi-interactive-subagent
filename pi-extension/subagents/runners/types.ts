@@ -86,6 +86,8 @@ export interface RunnerResultContext {
   sentinelFile?: string;
   cwd: string;
   turnStartTime: number;
+  /** Pi only: ignore entries at or before this line (resume scoping). */
+  afterLine?: number;
   sessionId?: string;
   agentName: string;
   readPane: (lines: number) => string;
@@ -93,20 +95,50 @@ export interface RunnerResultContext {
 
 export interface RunnerResumeContext {
   platform: NodeJS.Platform;
+  /** Pi's transcript path; a placeholder for other runners. */
   sessionFile: string;
+  /** Pi header id / Claude UUID / Agy conversation id. */
+  sessionId: string | null;
+  /** Original non-Pi launch argv, replayed to preserve model/permissions/identity. */
+  launchArgs: string[] | null;
   name: string;
   id: string;
-  activityFile: string;
-  artifactDir: string;
-  subagentDonePath: string;
-  /** File containing the follow-up message, appended as `@<path>`. */
+  /** Follow-up text for agent-mode runners. */
+  message: string;
+  /** File containing the follow-up message, appended as `@<path>` (Pi). */
   messageFile: string | null;
-  loadout: SubagentLoadout;
+  /** Pi only; null for runners that do not need a sandbox snapshot. */
+  loadout: SubagentLoadout | null;
   autoExit: boolean;
   agentDir: string | null;
   spawnable: string[] | null;
   cwd: string | null;
+  artifactDir: string;
+  activityFile: string;
+  subagentDonePath: string;
 }
+
+/**
+ * How a resumed runner is transported.
+ *
+ * - `shell`: type a complete command into the new pane (Pi's verified path).
+ * - `agent`: register the agent with Herdr and deliver the follow-up prompt.
+ */
+export type RunnerResumePlan =
+  | {
+      mode: "shell";
+      command: string;
+      cwd?: string;
+      env?: Record<string, string>;
+      scriptPreamble?: string[];
+    }
+  | {
+      mode: "agent";
+      startArgs: string[];
+      env: Record<string, string>;
+      prompt: string | null;
+      cwd: string;
+    };
 
 export interface RunnerAdapter {
   readonly id: CanonicalRunner;
@@ -122,6 +154,6 @@ export interface RunnerAdapter {
   /** Pi sessions carry usage stats and a canonical session id for follow-ups. */
   readonly supportsSessionStats: boolean;
   buildLaunch(ctx: RunnerLaunchContext): LaunchPlan;
-  buildResume?(ctx: RunnerResumeContext): string | null;
+  buildResume?(ctx: RunnerResumeContext): RunnerResumePlan | null;
   extractResult(ctx: RunnerResultContext): { summary: string; sessionId?: string } | null;
 }

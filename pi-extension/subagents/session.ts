@@ -165,6 +165,27 @@ export function registerName(
   }
 }
 
+/**
+ * Merge fields into an existing registry entry. Used by the monitor/resume
+ * paths so they cannot drop fields (notably `launchArgs`) written at spawn.
+ * A missing entry is a no-op: it is never created half-populated.
+ */
+export function updateNameRegistryEntry(
+  artifactDir: string,
+  name: string,
+  patch: Partial<NameRegistryEntry>,
+): void {
+  try {
+    const registry = readNameRegistry(artifactDir);
+    const existing = registry[name];
+    if (!existing) return;
+    registry[name] = { ...existing, ...patch };
+    writeNameRegistry(artifactDir, registry);
+  } catch {
+    // Best-effort: a failed update only loses resume metadata.
+  }
+}
+
 /** Resolve a name to its registry entry within a spawner session, or null. */
 export function resolveNameInRegistry(
   artifactDir: string,

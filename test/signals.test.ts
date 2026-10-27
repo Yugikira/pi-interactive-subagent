@@ -32,6 +32,7 @@ import {
   writeParkedSignal,
   type SubagentLoadout,
 } from "../pi-extension/subagents/signals.ts";
+import { updateNameRegistryEntry } from "../pi-extension/subagents/session.ts";
 
 let dir: string;
 
@@ -50,6 +51,33 @@ function sessionPath(name = "session"): string {
 function listTemps(): string[] {
   return readdirSync(dir).filter((name) => name.endsWith(".tmp"));
 }
+
+describe("name registry patches", () => {
+  it("merges fields without dropping resume metadata", () => {
+    writeNameRegistry(dir, {
+      scout: {
+        sessionFile: "/s.jsonl",
+        sessionId: "native-1",
+        runner: "claude",
+        launchArgs: ["--dangerously-skip-permissions"],
+        cwd: "/work",
+      },
+    });
+
+    updateNameRegistryEntry(dir, "scout", { surface: "pane-2" });
+
+    const entry = readNameRegistry(dir).scout;
+    assert.equal(entry.surface, "pane-2");
+    assert.deepEqual(entry.launchArgs, ["--dangerously-skip-permissions"]);
+    assert.equal(entry.cwd, "/work");
+    assert.equal(entry.sessionId, "native-1");
+  });
+
+  it("never creates a half-populated entry", () => {
+    updateNameRegistryEntry(dir, "missing", { surface: "pane-3" });
+    assert.equal(readNameRegistry(dir).missing, undefined);
+  });
+});
 
 describe("signals.ts atomic writes", () => {
   it("writes complete JSON and leaves no temp files", () => {

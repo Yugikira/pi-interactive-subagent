@@ -19,5 +19,12 @@ Terms used throughout the extension and its docs.
   `active`/`waiting`/`stalled`/`starting` labels.
 - **Delivery** — steering a subagent's result or error back to the parent as one message per
   turn. Duplicate delivery is suppressed per turn.
+- **Resume** — relaunching a finished subagent against its native session (`pi --session`,
+  `claude --resume`, `agy --conversation`). The runner adapter returns a **resume plan** whose
+  transport is either `agent` (Herdr `agent start` + `agent prompt`) or `shell` (a command typed
+  into the new pane).
+- **Name registry** — the persistent per-spawner map from a display name to its runner, native
+  session id, cwd, surface, and launch argv. It is the handle that lets `subagent_message` steer a
+  live run or resume a finished one after the in-memory entry is gone.
 - **Layout** — how a subagent pane is created: a right/down split or a new tab, controlled by
   `PI_SUBAGENT_LAYOUT`.

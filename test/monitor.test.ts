@@ -60,6 +60,20 @@ describe("monitor.ts pane mapping", () => {
     });
   });
 
+  it("identifies a pane by its surface even when another pane shares the runner kind", () => {
+    const entry = makeEntry({ herdrAgentName: "pi", surface: "w1:p2" });
+    const panes: PaneSummary[] = [
+      { paneId: "w1:p1", agent: "pi", agentStatus: "idle", agentSessionValue: "parent" },
+      { paneId: "w1:p2", agent: "pi", agentStatus: "working", agentSessionValue: "child" },
+    ];
+
+    assert.deepEqual(inspectEntry(entry, panes), {
+      kind: "present",
+      status: "working",
+      sessionId: "child",
+    });
+  });
+
   it("maps a missing agent to missing and a present one to its status", () => {
     assert.deepEqual(inspectEntry(makeEntry(), []), { kind: "missing" });
 
@@ -114,6 +128,80 @@ describe("monitor.ts tick", () => {
     await runMonitorTick([entry], deps);
 
     assert.equal(entry.sessionId, "native-session-1");
+  });
+
+  it("reports a new or changed native session id for non-Pi runners", async () => {
+    const seen: Array<{ id: string; previous: string | undefined }> = [];
+    const entry = makeEntry({ cli: "claude", sessionId: "native-1" });
+    const deps = makeDeps({
+      listPanes: async () => [
+        {
+          paneId: "w1:p1",
+          agent: "scout",
+          agentStatus: "working",
+          agentSessionValue: "native-1",
+        },
+      ],
+      onSessionId: (_entry, id, previous) => seen.push({ id, previous }),
+    });
+
+    await runMonitorTick([entry], deps);
+    assert.deepEqual(seen, [], "an unchanged id must not fire the callback");
+
+    deps.listPanes = async () => [
+      {
+        paneId: "w1:p1",
+        agent: "scout",
+        agentStatus: "working",
+        agentSessionValue: "native-2",
+      },
+    ];
+    await runMonitorTick([entry], deps);
+
+    assert.deepEqual(seen, [{ id: "native-2", previous: "native-1" }]);
+    assert.equal(entry.sessionId, "native-2");
+  });
+
+  it("does not overwrite a Pi header id with a changed pane value", async () => {
+    const entry = makeEntry({ cli: "pi", sessionId: "header-id" });
+    const deps = makeDeps({
+      listPanes: async () => [
+        {
+          paneId: "w1:p1",
+          agent: "scout",
+          agentStatus: "working",
+          agentSessionValue: "other-value",
+        },
+      ],
+    });
+
+    await runMonitorTick([entry], deps);
+    assert.equal(entry.sessionId, "header-id");
+  });
+
+  it("does not settle a child when a same-kind sibling pane is done", async () => {
+    const controller = new CompletionController(sidecarPolicy, 0);
+    const entry = makeEntry({
+      cli: "pi",
+      herdrAgentName: "pi",
+      surface: "w1:p2",
+      completion: controller,
+    });
+    const deps = makeDeps({
+      listPanes: async () => [
+        { paneId: "w1:p1", agent: "pi", agentStatus: "done" },
+        { paneId: "w1:p2", agent: "pi", agentStatus: "working" },
+      ],
+    });
+
+    await runMonitorTick([entry], deps);
+
+    let settled = false;
+    controller.result.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    assert.equal(settled, false, "the child's own working pane must win");
   });
 
   it("delivers a question exactly once", async () => {

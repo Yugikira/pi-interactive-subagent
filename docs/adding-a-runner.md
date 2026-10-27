@@ -81,9 +81,20 @@ means the turn ended.
 
 - `buildLaunch` returns raw `startArgs` for `herdr agent start`, the complete pane env from
   `buildCommonEnv`, and either a separate `prompt` or (for Pi) a shell fallback command.
-- `buildResume` is optional and currently only implemented by Pi. Set `supportsResume: false` for
-  everything else; `subagent_message` will return a clear error instead of relaunching the wrong
-  CLI.
+- `buildResume` is optional. It returns a `RunnerResumePlan`, a transport union:
+  - `{ mode: "agent", startArgs, env, prompt, cwd }` — register the CLI with Herdr and deliver the
+    follow-up through `agent prompt`. Claude uses `["--resume", sessionId, ...launchArgs]`; Agy uses
+    `["--conversation", sessionId, ...launchArgs]`. Replaying `launchArgs` preserves the model,
+    permissions, and system-prompt-file identity from the original launch.
+  - `{ mode: "shell", command, cwd }` — type a complete command into the new pane. Pi keeps its
+    verified `--session <file>` path.
+  The handler switches on `mode`, never on a runner id. Set `supportsResume: false` for runners with
+  no native session contract; `subagent_message` returns a clear error instead of relaunching a
+  blank session.
+- Resume prerequisites come from the name registry: `sessionId` is the runner-native handle (Pi
+  header id, Claude UUID, Agy conversation id), and non-Pi runners also persist `cwd` and
+  `launchArgs`. The extension captures the id at spawn, from the monitor's pane inventory, and in
+  the watcher before the pane closes; a runner that cannot supply one must refuse.
 - `supportsTurnInterrupt: true` requires a verified Escape/interrupt contract. Only Pi sets it.
 
 ### Platform quoting

@@ -7,7 +7,7 @@
  * `PI_CODING_AGENT_DIR` are present on the normal `startAgent` path, not just
  * the shell fallback and resume scripts.
  */
-import type { RunnerLaunchContext } from "./types.ts";
+import type { RunnerLaunchContext, RunnerResumeContext } from "./types.ts";
 
 export interface SignalEnvInput {
   displayName: string;
@@ -44,6 +44,20 @@ export function buildCommonEnv(ctx: RunnerLaunchContext): Record<string, string>
     sessionFile: ctx.sessionFile,
     activityFile: ctx.activityFile,
     agentName: ctx.agentName,
+    autoExit: ctx.autoExit,
+    agentDir: ctx.agentDir,
+    spawnable: ctx.spawnable,
+  });
+}
+
+/** Pane environment for a resumed agent-mode runner. */
+export function buildResumeEnv(ctx: RunnerResumeContext): Record<string, string> {
+  return buildSignalEnv({
+    displayName: ctx.name,
+    id: ctx.id,
+    sessionFile: ctx.sessionFile,
+    activityFile: ctx.activityFile,
+    agentName: ctx.loadout?.agent ?? null,
     autoExit: ctx.autoExit,
     agentDir: ctx.agentDir,
     spawnable: ctx.spawnable,

@@ -85,7 +85,11 @@ export interface SubagentLoadout {
 export interface NameRegistryEntry {
   /** Absolute path to the subagent's session .jsonl file. */
   sessionFile: string;
-  /** Canonical session header id (kept for display/lineage). */
+  /**
+   * Runner-native session reference: the Pi session header id, the Claude
+   * transcript UUID, or the Agy conversation id. Kept for display/lineage and
+   * used by `subagent_message` to resume the session.
+   */
   sessionId: string | null;
   /** Runner that produced the session (absent on legacy entries = pi). */
   runner?: string;
@@ -97,6 +101,14 @@ export interface NameRegistryEntry {
   surface?: string;
   /** Herdr agent name for the pane above (absent on legacy entries). */
   herdrAgentName?: string;
+  /** Working directory the runner was launched in (needed by native readers on resume). */
+  cwd?: string;
+  /**
+   * Non-Pi only: the exact argv passed after `herdr agent start ... --`. This
+   * replays the model, permissions, and system-prompt-file flags on resume.
+   * Never stored for Pi (its argv contains task text).
+   */
+  launchArgs?: string[];
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;

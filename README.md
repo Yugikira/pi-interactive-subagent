@@ -44,7 +44,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | Tool | Description |
 | --- | --- |
 | `subagent` | Spawn a sub-agent in a dedicated Herdr pane (async) |
-| `subagent_message` | Message a sub-agent by name — steers it if running, resumes its Pi session if finished |
+| `subagent_message` | Message a sub-agent by name — steers it if running, resumes its Pi, Claude, or Agy session if finished |
 | `subagent_interrupt` | Send Escape to the active **Pi** turn without closing the pane or session |
 | `subagent_stop` | Stop a running sub-agent and close its pane (optionally keep the pane with `closePane: false`). A completed `keepOpen` sub-agent can still be stopped by name — its leftover pane is tracked in the session's name registry. |
 | `subagents_list` | List available agent definitions and supported CLI runners |
@@ -102,7 +102,7 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
 - **Running** — the message is delivered directly into the live agent session via Herdr's prompt API. The call returns immediately; the eventual completion still arrives as a steer message.
-- **Finished (Pi only)** — the session is resumed with the message as the follow-up task, fire-and-forget. Non-Pi sessions cannot be resumed; spawn a fresh sub-agent instead.
+- **Finished (Pi, Claude, Agy)** — the session is resumed against its native session id in a new pane: `pi --session <file>`, `claude --resume <uuid>`, or `agy --conversation <id>`. The follow-up is fire-and-forget and only the new turn's result is delivered. Missing native session metadata, a removed loadout/identity file, or a runner without a resume contract returns a clear “spawn a fresh sub-agent” error instead of relaunching a blank session.
 
 ### Interrupting and stopping
 
@@ -130,8 +130,8 @@ ambiguous or a decision materially affects the work. The session **stays open** 
 | Runner | Session read | `keepOpen` | `subagent_interrupt` | Resume |
 | --- | --- | --- | --- | --- |
 | `pi` | native JSONL + activity | yes | yes | yes |
-| `agy` | native transcript | yes | no | no |
-| `claude` | native transcript | yes | no | no |
+| `agy` | native transcript | yes | no | yes (`--conversation`) |
+| `claude` | native transcript | yes | no | yes (`--resume`) |
 | `codex` | JSON output protocol | yes | no | no |
 | `grok` | JSON output protocol | yes | no | no |
 | `opencode` | JSON output protocol | yes | no | no |
