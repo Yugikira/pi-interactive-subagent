@@ -11,9 +11,7 @@ import { formatElapsed, resolveResultPresentation } from "./format.ts";
 import {
   getAgentState,
   paneExistsAsync,
-  readAgentOutput,
-  readScreen,
-  sanitizeTerminalOutput,
+  readCapturedOutput,
   terminateSurface,
 } from "./herdr.ts";
 import { persistRunning } from "./name-registry.ts";
@@ -85,6 +83,31 @@ function notifyStall(running: RunningSubagent, elapsedMs: number): void {
   );
 }
 
+/** Clean up or re-arm pane and tracking state after a completed turn. */
+async function finalizeTurnCleanup(
+  running: RunningSubagent,
+  surface: string,
+  herdrAgentName: string,
+): Promise<void> {
+  if (!running.interactive) {
+    await new Promise((r) => setTimeout(r, 500));
+    terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
+    runningSubagents.delete(running.id);
+  } else {
+    // A keepOpen turn is over, but its pane is the only handle the user has.
+    // Only a confirmed absence may discard the entry; an unreadable Herdr
+    // inventory keeps it so subagent_stop can still close the pane.
+    const stillThere = await paneExistsAsync(surface);
+    if (stillThere === false) {
+      runningSubagents.delete(running.id);
+    } else {
+      running.abortController = undefined;
+      running.turn = (running.turn ?? 1) + 1;
+      running.turnStartTime = Date.now();
+    }
+  }
+}
+
 export async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -145,19 +168,12 @@ export async function watchSubagent(
           afterLine: running.resumeFromLine,
           sessionId: sessionRefId,
           agentName: herdrAgentName,
-          readPane: (lines) => sanitizeTerminalOutput(readAgentOutput(herdrAgentName, lines)),
+          readPane: (lines) => readCapturedOutput(surface, herdrAgentName, lines),
         })?.summary ?? "";
 
-      // 2. Fallback to reading agent output via Herdr with expanded buffer and sanitization
+      // 2. Fallback to captured terminal output via Herdr
       if (!summary) {
-        summary = sanitizeTerminalOutput(readAgentOutput(herdrAgentName, 1000));
-      }
-
-      // 3. Fallback to reading the pane screen
-      if (!summary) {
-        summary = sanitizeTerminalOutput(
-          readScreen(surface, 1000).replace(/__SUBAGENT_DONE_\d+__/, "")
-        );
+        summary = readCapturedOutput(surface, herdrAgentName, 1000);
       }
 
       if (!summary) {
@@ -167,24 +183,7 @@ export async function watchSubagent(
             : `${cli} completed without output`;
       }
 
-      if (!running.interactive && result.exitCode === 0) {
-        await new Promise((r) => setTimeout(r, 500));
-        terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
-      }
-      if (!running.interactive) {
-        runningSubagents.delete(running.id);
-      } else {
-        // Keep a keepOpen entry unless its pane is confirmed gone. This is the
-        // handle `subagent_stop` uses to close a leftover pane.
-        const stillThere = await paneExistsAsync(surface);
-        if (stillThere === false) {
-          runningSubagents.delete(running.id);
-        } else {
-          running.abortController = undefined;
-          running.turn = (running.turn ?? 1) + 1;
-          running.turnStartTime = Date.now();
-        }
-      }
+      await finalizeTurnCleanup(running, surface, herdrAgentName);
 
       running.delivery = { turn: deliveryTurn, state: "pending" };
       return {
@@ -209,47 +208,27 @@ export async function watchSubagent(
           afterLine: running.resumeFromLine,
           sessionId: running.sessionId,
           agentName: herdrAgentName,
-          readPane: (lines) => sanitizeTerminalOutput(readAgentOutput(herdrAgentName, lines)),
+          readPane: (lines) => readCapturedOutput(surface, herdrAgentName, lines),
         })?.summary ?? "";
-      if (!summary) {
-        summary = result.errorMessage
-          ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
-            ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output";
-      }
-    } else {
-      summary =
-        sanitizeTerminalOutput(readAgentOutput(herdrAgentName, 1000)) ||
-        (result.errorMessage
-          ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
-            ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output");
+    }
+
+    // Fallback to captured terminal output if session reading yielded nothing
+    if (!summary) {
+      summary = readCapturedOutput(surface, herdrAgentName, 1000);
+    }
+
+    if (!summary) {
+      summary = result.errorMessage
+        ? `Subagent error: ${result.errorMessage}`
+        : result.exitCode !== 0
+          ? `Sub-agent exited with code ${result.exitCode}`
+          : "Sub-agent exited without output";
     }
 
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    if (!running.interactive && result.exitCode === 0) {
-      await new Promise((r) => setTimeout(r, 500));
-      terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
-    }
-    if (!running.interactive) {
-      runningSubagents.delete(running.id);
-    } else {
-      // A keepOpen turn is over, but its pane is the only handle the user has.
-      // Only a confirmed absence may discard the entry; an unreadable Herdr
-      // inventory keeps it so subagent_stop can still close the pane.
-      const stillThere = await paneExistsAsync(surface);
-      if (stillThere === false) {
-        runningSubagents.delete(running.id);
-      } else {
-        running.abortController = undefined;
-        running.turn = (running.turn ?? 1) + 1;
-        running.turnStartTime = Date.now();
-      }
-    }
+    await finalizeTurnCleanup(running, surface, herdrAgentName);
 
     running.delivery = { turn: deliveryTurn, state: "pending" };
     return {
@@ -265,11 +244,23 @@ export async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    runningSubagents.delete(running.id);
     running.delivery = { turn: deliveryTurn, state: "pending" };
 
-    if (signal.aborted) {
+    if (!running.interactive) {
+      runningSubagents.delete(running.id);
       terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
+    } else {
+      // For keepOpen subagents, halt runaway execution but keep the pane for inspection
+      terminateSurface(surface, { agentName: herdrAgentName, closePane: false });
+      const stillThere = await paneExistsAsync(surface);
+      if (stillThere === false) {
+        runningSubagents.delete(running.id);
+      } else {
+        running.abortController = undefined;
+      }
+    }
+
+    if (signal.aborted) {
       return {
         name,
         task,
@@ -281,7 +272,6 @@ export async function watchSubagent(
         cli: running.cli,
       };
     }
-    terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
     return {
       name,
       task,

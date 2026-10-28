@@ -1134,6 +1134,46 @@ export async function readAgentOutputAsync(target: string, lines = 1000): Promis
   }
 }
 
+/**
+ * Read and sanitize terminal output from an agent pane or surface.
+ * Attempts structured output via `herdr agent read` first (by agentName or surface),
+ * falling back to raw screen capture (`readScreen`), and strips ANSI escapes, chrome, and sentinels.
+ */
+export function readCapturedOutput(surface: string, agentName?: string, lines = 1000): string {
+  let raw = "";
+  if (agentName) {
+    raw = readAgentOutput(agentName, lines);
+  }
+  if (!raw && surface) {
+    raw = readAgentOutput(surface, lines);
+  }
+  if (!raw && surface) {
+    raw = readScreen(surface, lines);
+  }
+  return sanitizeTerminalOutput(raw);
+}
+
+/**
+ * Async variant of `readCapturedOutput`.
+ */
+export async function readCapturedOutputAsync(
+  surface: string,
+  agentName?: string,
+  lines = 1000,
+): Promise<string> {
+  let raw = "";
+  if (agentName) {
+    raw = await readAgentOutputAsync(agentName, lines);
+  }
+  if (!raw && surface) {
+    raw = await readAgentOutputAsync(surface, lines);
+  }
+  if (!raw && surface) {
+    raw = await readScreenAsync(surface, lines);
+  }
+  return sanitizeTerminalOutput(raw);
+}
+
 /** Send key presses to an agent (e.g. esc, ctrl+c). */
 export function sendAgentKeys(target: string, keys: string[]): void {
   requireHerdr();

@@ -91,6 +91,8 @@ export interface RunnerResultContext {
   sessionId?: string;
   agentName: string;
   readPane: (lines: number) => string;
+  brainDir?: string;
+  projectsDir?: string;
 }
 
 export interface RunnerResumeContext {

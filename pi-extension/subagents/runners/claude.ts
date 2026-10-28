@@ -77,6 +77,7 @@ export const claudeAdapter: RunnerAdapter = {
       sessionId: ctx.sessionId,
       sentinelFile: ctx.sentinelFile,
       afterTimestamp: ctx.turnStartTime,
+      projectsDir: ctx.projectsDir,
     });
     return summary ? { summary } : null;
   },
