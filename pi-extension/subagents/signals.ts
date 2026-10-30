@@ -331,6 +331,18 @@ export function writeExitSignal(
   });
 }
 
+/**
+ * Write the `.exit` completion sidecar for a successful auto-exit turn. Without
+ * it the parent has no completion signal: Herdr may keep the pane after the
+ * agent process exits, so neither pane loss nor an idle state can settle it.
+ */
+export function writeDoneExitSignal(sessionFile: string): void {
+  writeJsonAtomic(exitSignalPath(sessionFile), {
+    type: "done",
+    writtenAt: Date.now(),
+  });
+}
+
 export function writeParkedSignal(
   sessionFile: string,
   info: { name?: string; agent?: string },

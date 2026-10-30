@@ -26,6 +26,12 @@ All notable changes to `interactive-subagents` will be documented in this file.
   roots remain allowed.
 - **A failed Pi turn reports its provider error before the pane fallback**, which
   is now bounded to 50 lines.
+- **Successful auto-exit Pi subagents report completion reliably.** A
+  `keepOpen: false` spawn of an agent with `auto-exit: true` (for example
+  `researcher` or `scout`) now writes the `.exit` done sidecar when the child
+  shuts down. Previously the child exited without a completion signal, so the
+  parent never delivered the result and the Herdr pane stayed open until the
+  orchestrator session shut down.
 - **Keep-open turns keep accurate turn numbers, resume line offsets, and
   per-turn elapsed time**; direct input in a kept-open pane re-arms the watcher,
   and mid-turn steering resets the completion controller instead of settling

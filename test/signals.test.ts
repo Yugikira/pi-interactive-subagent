@@ -25,6 +25,7 @@ import {
   readLoadout,
   readNameRegistry,
   writeAskSignal,
+  writeDoneExitSignal,
   writeExitSignal,
   writeJsonAtomic,
   writeLoadout,
@@ -190,6 +191,17 @@ describe("signals.ts exit / parked / ask codecs", () => {
     writeJsonAtomic(exitSignalPath(file), { type: "done" });
 
     assert.deepEqual(consumeExitSignal(file, Date.now()), { reason: "done", exitCode: 0 });
+  });
+
+  it("accepts the done exit signal written on a successful auto-exit", () => {
+    const file = sessionPath();
+    writeDoneExitSignal(file);
+
+    assert.deepEqual(consumeExitSignal(file, Date.now() - 1_000), {
+      reason: "done",
+      exitCode: 0,
+    });
+    assert.equal(existsSync(exitSignalPath(file)), false);
   });
 
   it("accepts a fresh parked signal and drops a stale one", () => {

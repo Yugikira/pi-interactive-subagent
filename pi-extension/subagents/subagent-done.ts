@@ -24,7 +24,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { createSubagentActivityRecorder } from "./activity.ts";
-import { writeAskSignal, writeExitSignal, writeParkedSignal } from "./signals.ts";
+import { writeAskSignal, writeDoneExitSignal, writeExitSignal, writeParkedSignal } from "./signals.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -249,7 +249,19 @@ export default function (pi: ExtensionAPI) {
       // can report a clear failure with the underlying error message.
       // Without this the parent would only see exit code 0 and a stale
       // assistant message, mistaking the crash for a successful completion.
-      writeErrorSidecar(sessionFile, findLatestAssistantError(messages));
+      const errorInfo = findLatestAssistantError(messages);
+      if (errorInfo) {
+        writeErrorSidecar(sessionFile, errorInfo);
+      } else if (sessionFile) {
+        // A successful auto-exit has no pane loss to detect: Herdr may keep
+        // the pane after the agent process exits. Announce the completed turn
+        // explicitly so the parent delivers and closes it.
+        try {
+          writeDoneExitSignal(sessionFile);
+        } catch {
+          // Best effort — the pane-exit fallback still applies.
+        }
+      }
 
       recorder.agentEndDone();
       ctx.shutdown();
