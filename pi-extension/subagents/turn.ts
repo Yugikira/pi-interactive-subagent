@@ -210,13 +210,15 @@ export async function watchSubagent(
     }
 
     if (!summary) {
+      // Prefer the structured error over a pane scrape; the pane can contain
+      // hundreds of lines of TUI chrome, so bound the fallback.
       summary =
-        (await readCapturedOutputAsync(surface, herdrAgentName, 1000)) ||
         (result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
-            ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output");
+          : (await readCapturedOutputAsync(surface, herdrAgentName, 50)) ||
+            (result.exitCode !== 0
+              ? `Sub-agent exited with code ${result.exitCode}`
+              : "Sub-agent exited without output"));
     }
 
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;

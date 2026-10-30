@@ -8,9 +8,36 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { posix } from "node:path";
+
+const RM_SEGMENT = /\brm\s+([^;&|\n]+)/g;
+const RM_DESTRUCTIVE = /(?:^|\s)(?:-[a-zA-Z]*[rfR][a-zA-Z]*|--recursive|--force)(?=\s|$)/;
+const TEMP_ROOT = /^\/(?:tmp|var\/tmp|private\/tmp)\/*$/;
+const TEMP_TARGET = /^\/(?:tmp|var\/tmp|private\/tmp)\//;
+
+/** Whether an `rm` argument names a path the guard must protect. */
+function isProtectedRmTarget(rawTarget: string): boolean {
+	const target = rawTarget.replace(/^['"]+|['"]+$/g, "");
+	if (target.startsWith("~")) return true;
+	if (!target.startsWith("/")) return false;
+	const normalized = posix.normalize(target);
+	if (TEMP_ROOT.test(normalized)) return true;
+	return !TEMP_TARGET.test(normalized);
+}
+
+/** Whether an `rm` invocation is recursive/forced and targets a protected path. */
+function rmTouchesProtectedPath(args: string): boolean {
+	if (!RM_DESTRUCTIVE.test(args)) return false;
+	for (const token of args.trim().split(/\s+/)) {
+		if (!token || token.startsWith("-")) continue;
+		if (isProtectedRmTarget(token)) return true;
+	}
+	return false;
+}
 
 export const DANGEROUS_PATTERNS = [
-	/\brm\s+(?:-\S+\s+)*(?:-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(?:-\S+\s+)*['"]?(?:\/|\/\*|~|~\/|~\/\*)['"]?(?:\s|$|;|&|\|)/,
+	// `rm` needs target-path normalization and long-option handling, so it is
+	// checked by rmTouchesProtectedPath() instead of a single regex here.
 	/\bsudo\b/,
 	/\bmkfs\b/,
 	/\bdd\s+if=/,
@@ -29,6 +56,11 @@ export const DANGEROUS_PATTERNS = [
 
 export function isDangerous(command: string): string | null {
 	const normalized = command.replace(/\\\n/g, " ");
+	for (const match of normalized.matchAll(RM_SEGMENT)) {
+		if (rmTouchesProtectedPath(match[1])) {
+			return "Command blocked by safe_bash: recursive/forced rm targeting a protected path";
+		}
+	}
 	for (const pattern of DANGEROUS_PATTERNS) {
 		if (pattern.test(normalized)) {
 			return `Command blocked by safe_bash: matches dangerous pattern ${pattern}`;

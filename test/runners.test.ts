@@ -201,6 +201,41 @@ describe("runner provider extensions", () => {
     writeFileSync(gitExt, "");
     assert.deepEqual(providerExtensionPaths("stealth", npmDir, gitDir), [gitExt]);
   });
+
+  it("finds a globally installed provider when the child uses a local agent dir", () => {
+    const globalAgentDir = join(dir, "global-agent");
+    const localAgentDir = join(dir, "local-agent");
+    const npmDir = join(globalAgentDir, "npm", "node_modules");
+    const pkgDir = join(npmDir, "pi-antigravity");
+    const extPath = join(pkgDir, "src", "index.ts");
+    mkdirSync(dirname(extPath), { recursive: true });
+    writeFileSync(
+      join(pkgDir, "package.json"),
+      JSON.stringify({ name: "pi-antigravity", pi: { extensions: ["./src/index.ts"] } }),
+    );
+    writeFileSync(extPath, "");
+    mkdirSync(localAgentDir, { recursive: true });
+
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = globalAgentDir;
+    try {
+      const plan = buildPiLaunch(
+        makeCtx({
+          model: "antigravity/gemini-3.8-flash",
+          loadout: {
+            ...emptyLoadout,
+            model: "antigravity/gemini-3.8-flash",
+            toolAllowlist: "read",
+            agentDir: localAgentDir,
+          },
+        }),
+      );
+      assert.ok(plan.startArgs.includes(extPath), "global provider extension should be found");
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
+  });
 });
 
 describe("pi adapter launch plan", () => {

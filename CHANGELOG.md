@@ -2,6 +2,47 @@
 
 All notable changes to `interactive-subagents` will be documented in this file.
 
+## [4.0.1] - 2026-10-30
+
+### Fixed
+
+- **Sandboxed Pi resume keeps third-party model providers.** Provider extension
+  discovery moved into the sandbox replay, so `pi --session … --no-extensions
+  --model <provider>/<model>` re-enables the provider extension for both launch
+  and resume. Discovery searches the child's agent dir and the global agent dir,
+  so a project-local `.pi/agent` no longer hides a globally installed package.
+- **The spawn allowlist is enforced at every depth.** With `PI_SUBAGENT_ALLOWED`
+  set, a spawn must name a permitted agent; runner-only launches and unknown
+  `cli` values are rejected instead of falling back to an unrestricted `pi`.
+- **Windows absolute `cwd` values are resolved instead of concatenated**, and the
+  Windows-only path test is guarded for POSIX hosts.
+- **Results are read from the child's pane surface before its agent name**, using
+  the async Herdr variants on the completion path so a sibling `pi`/`claude` pane
+  cannot be read by mistake.
+- **`safe_bash` blocks recursive/forced `rm` against protected paths again.**
+  Every `rm` in a command is scanned (including `--recursive`, `--force`, and
+  `-R`); `~` and its subpaths, `/`, `/*`, and absolute paths outside `/tmp`,
+  `/var/tmp`, and `/private/tmp` are blocked, while relative paths and temp
+  roots remain allowed.
+- **A failed Pi turn reports its provider error before the pane fallback**, which
+  is now bounded to 50 lines.
+- **Keep-open turns keep accurate turn numbers, resume line offsets, and
+  per-turn elapsed time**; direct input in a kept-open pane re-arms the watcher,
+  and mid-turn steering resets the completion controller instead of settling
+  early.
+- **`/reload` keeps running watchers and status monitoring alive**; the shared
+  runtime maps survive module reloads and a reload no longer turns active
+  subagents into cancellation errors.
+- **Stop/resume metadata is accurate**: resumed Pi subagents keep their `(agent)`
+  tag, and `subagent_stop` reports `stopped: false` when the pane could not be
+  closed.
+
+### Removed
+
+- The legacy `pollForExit` poller, its sidecar wrappers, and its test seams;
+  completion is covered by `completion.ts` + `signals.ts`.
+- The unused Claude stop-hook plugin under `pi-extension/subagents/plugin/`.
+
 ## [4.0.0] - 2026-10-27
 
 ### Added

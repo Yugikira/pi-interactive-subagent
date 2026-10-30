@@ -4399,32 +4399,46 @@ describe("herdr.ts", () => {
     });
 
     it("resolveSubagentPaths handles Windows absolute and relative paths without mangling", () => {
-      const resolvedAbsWin = resolveSubagentPaths({ cwd: "D:\\repos\\app" }, null);
-      assert.equal(resolvedAbsWin.effectiveCwd, "D:\\repos\\app");
+      if (process.platform === "win32") {
+        const resolvedAbsWin = resolveSubagentPaths({ cwd: "D:\\repos\\app" }, null);
+        assert.equal(resolvedAbsWin.effectiveCwd, "D:\\repos\\app");
+      }
 
       const resolvedRel = resolveSubagentPaths({ cwd: "sub/dir" }, null);
       assert.equal(resolvedRel.effectiveCwd, join(process.cwd(), "sub", "dir"));
     });
 
-    it("safe_bash isDangerous blocks root/home destruction while allowing safe absolute/relative paths", () => {
-      // Dangerous patterns that must be blocked
+    it("safe_bash blocks home/system destruction while allowing temp and relative paths", () => {
+      // Protected targets
       assert.ok(isDangerous("rm -rf /"));
       assert.ok(isDangerous("rm -rf /*"));
       assert.ok(isDangerous("rm -rf ~"));
       assert.ok(isDangerous("rm -rf ~/"));
       assert.ok(isDangerous("rm -rf ~/*"));
+      assert.ok(isDangerous("rm -rf ~/Documents"));
+      assert.ok(isDangerous("rm -rf /home/user"));
+      assert.ok(isDangerous("rm -rf /etc/passwd"));
+      assert.ok(isDangerous("rm -rf /var/log/app.log"));
+      assert.ok(isDangerous("rm -rf /tmp/../home/user"));
+      assert.ok(isDangerous("rm -rf /tmp"));
+      assert.ok(isDangerous("rm -rf /tmp/"));
       assert.ok(isDangerous("rm -f -r /"));
       assert.ok(isDangerous("rm -r -f ~"));
       assert.ok(isDangerous("rm -rf '/'"));
       assert.ok(isDangerous("rm -rf '~'"));
       assert.ok(isDangerous("rm -rf / && echo done"));
       assert.ok(isDangerous("rm -rf ~; echo done"));
+      assert.ok(isDangerous("rm --recursive --force /"));
+      assert.ok(isDangerous("rm -R /home/user"));
+      assert.ok(isDangerous("rm -f ./x; rm -rf /home/user"));
       assert.ok(isDangerous("sudo apt-get install"));
       assert.ok(isDangerous("mkfs.ext4 /dev/sda1"));
 
-      // Safe commands that must be allowed
+      // Temp roots and relative paths stay allowed
       assert.equal(isDangerous("rm -f /tmp/foo.txt"), null);
-      assert.equal(isDangerous("rm -rf /var/log/app.log"), null);
+      assert.equal(isDangerous("rm -rf /tmp/foo"), null);
+      assert.equal(isDangerous("rm -rf /var/tmp/build.log"), null);
+      assert.equal(isDangerous("rm -rf /private/tmp/x"), null);
       assert.equal(isDangerous("rm -rf ./build"), null);
       assert.equal(isDangerous("rm -rf tmp/cache"), null);
       assert.equal(isDangerous("rm file.txt"), null);

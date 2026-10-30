@@ -125,8 +125,14 @@ export function applySandboxToParts(
     const gitDir = loadout.agentDir
       ? join(loadout.agentDir, "git")
       : undefined;
+    // A project-local agent dir shadows the global one, but the provider package
+    // may still be installed globally, so search both roots when they differ.
     const providerExtensions =
-      opts.providerExtensions ?? providerExtensionPaths(provider, npmDir, gitDir);
+      opts.providerExtensions ??
+      [
+        ...providerExtensionPaths(provider, npmDir, gitDir),
+        ...(loadout.agentDir ? providerExtensionPaths(provider) : []),
+      ];
     for (const ext of providerExtensions) {
       extPaths.add(ext);
     }
