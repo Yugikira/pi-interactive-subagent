@@ -80,7 +80,7 @@ export function registerMessageRenderers(pi: ExtensionAPI): void {
           // Full view: complete summary + session info
           if (summary) {
             for (const line of summary.split("\n")) {
-              contentLines.push(line.slice(0, width - 6));
+              contentLines.push(truncateToWidth(line, Math.max(0, width - 6)));
             }
           }
           if (details.name || details.sessionFile) {
@@ -102,7 +102,7 @@ export function registerMessageRenderers(pi: ExtensionAPI): void {
           if (summary) {
             const previewLines = summary.split("\n").slice(0, 5);
             for (const line of previewLines) {
-              contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
+              contentLines.push(theme.fg("dim", truncateToWidth(line, Math.max(0, width - 6))));
             }
             const totalLines = summary.split("\n").length;
             if (totalLines > 5) {
@@ -175,7 +175,8 @@ export function registerMessageRenderers(pi: ExtensionAPI): void {
             theme.fg("dim", `Reply: subagent_message({ name: "${name}", message: "…" })`),
           );
         } else {
-          const preview = (details.question ?? "").split("\n")[0].slice(0, width - 10);
+          const firstLine = (details.question ?? "").split("\n")[0];
+          const preview = truncateToWidth(firstLine, Math.max(0, width - 10));
           contentLines.push(theme.fg("dim", preview));
           contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
         }

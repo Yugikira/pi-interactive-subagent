@@ -70,7 +70,7 @@ import {
   terminateRunning,
   uniqueRunningName,
 } from "./controls.ts";
-import { stopMonitor } from "./monitor-host.ts";
+import { ensureMonitorStarted, stopMonitor } from "./monitor-host.ts";
 import type { Ticker } from "./monitor.ts";
 import { registerSubagentTool } from "./tools/spawn.ts";
 import { registerListTool } from "./tools/list.ts";
@@ -101,8 +101,12 @@ export { paneShowsAgent } from "./launch.ts";
   prevMonitor?.stop();
   (globalThis as any)[MONITOR_KEY] = null;
   const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
-  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+  if (prevAbort && runningSubagents.size === 0) {
+    prevAbort.abort();
+    (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+  } else if (!prevAbort) {
+    (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+  }
 }
 
 export const __test__ = {
@@ -155,6 +159,9 @@ export const __test__ = {
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   setLatestApi(pi);
+  if (runningSubagents.size > 0) {
+    ensureMonitorStarted();
+  }
 
   // Opt-in termination diagnostics. Stop failures used to be invisible (every
   // herdr error was swallowed and the tool always reported success), so when a

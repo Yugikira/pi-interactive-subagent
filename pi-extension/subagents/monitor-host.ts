@@ -30,7 +30,7 @@ import {
   formatStatusAggregate,
   formatTransitionLine,
 } from "./status.ts";
-import { deliverPendingQuestion } from "./turn.ts";
+import { deliverPendingQuestion, watchAndDeliver } from "./turn.ts";
 import { renderSubagentWidgetLines } from "./widget.ts";
 
 let monitor: Ticker | null = null;
@@ -114,7 +114,21 @@ export function createMonitorDeps(): MonitorDeps {
       running.sessionId = sessionId;
       persistRunning(running);
     },
-    onWidgetDirty: () => updateWidget(),
+    onWidgetDirty: () => {
+      for (const running of runningSubagents.values()) {
+        if (
+          running.interactive &&
+          !running.completion &&
+          (!running.abortController || running.abortController.signal.aborted) &&
+          running.statusState.currentKind === "active" &&
+          getLatestApi()
+        ) {
+          running.turnStartTime = Date.now();
+          watchAndDeliver(running, { pi: getLatestApi(), updateWidget });
+        }
+      }
+      updateWidget();
+    },
     statusEnabled: () => getStatusConfig().enabled,
   };
 }

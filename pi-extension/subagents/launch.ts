@@ -876,6 +876,7 @@ export async function resumeSubagent(input: ResumeInput): Promise<ResumeOutcome>
     parentSessionId,
     herdrAgentName,
     task: message,
+    agent: loadout?.agent ?? undefined,
     cli: adapter.id,
     surface,
     startTime: startedAt,

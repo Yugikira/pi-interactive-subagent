@@ -776,9 +776,10 @@ export function readAgySession(options: ReadAgySessionOptions): string | null {
         const item = JSON.parse(lines[i]);
         if (!item || typeof item !== "object") continue;
 
-        if (options.afterTimestamp !== undefined && item.created_at) {
-          const t = Date.parse(item.created_at);
-          if (!isNaN(t) && t < options.afterTimestamp) {
+        const rawTime = item.created_at ?? item.timestamp;
+        if (options.afterTimestamp !== undefined && rawTime) {
+          const t = typeof rawTime === "number" ? rawTime : Date.parse(rawTime);
+          if (!isNaN(t) && t < options.afterTimestamp - 1000) {
             continue;
           }
         }
@@ -872,8 +873,8 @@ export function parseClaudeTranscriptFile(
         if (!item || typeof item !== "object") continue;
 
         if (afterTimestamp !== undefined && item.timestamp) {
-          const t = Date.parse(item.timestamp);
-          if (!isNaN(t) && t < afterTimestamp) {
+          const t = typeof item.timestamp === "number" ? item.timestamp : Date.parse(item.timestamp);
+          if (!isNaN(t) && t < afterTimestamp - 1000) {
             continue;
           }
         }

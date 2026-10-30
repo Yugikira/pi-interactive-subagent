@@ -76,18 +76,24 @@ export interface RunningSubagent {
   interactive: boolean;
 }
 
-/** All currently running subagents, keyed by id. */
-export const runningSubagents = new Map<string, RunningSubagent>();
+/** All currently running subagents, keyed by id. Shared across module reloads. */
+const RUNNING_SUBAGENTS_KEY = Symbol.for("pi-subagents/running-subagents");
+export const runningSubagents: Map<string, RunningSubagent> =
+  ((globalThis as any)[RUNNING_SUBAGENTS_KEY] ??= new Map<string, RunningSubagent>());
 
 /**
  * Names claimed by spawns that are mid-launch but not yet registered in
  * `runningSubagents`. Parallel spawns run their synchronous prefix before any
  * of them finishes, so without this they would all pick the same name.
  */
-export const reservedNames = new Set<string>();
+const RESERVED_NAMES_KEY = Symbol.for("pi-subagents/reserved-names");
+export const reservedNames: Set<string> =
+  ((globalThis as any)[RESERVED_NAMES_KEY] ??= new Set<string>());
 
 /** Panes created by this extension, used for smart tiling. */
-export const trackedSurfaces = new Set<string>();
+const TRACKED_SURFACES_KEY = Symbol.for("pi-subagents/tracked-surfaces");
+export const trackedSurfaces: Set<string> =
+  ((globalThis as any)[TRACKED_SURFACES_KEY] ??= new Set<string>());
 
 let latestPi: ExtensionAPI | null = null;
 let latestCtx: ExtensionContext | null = null;

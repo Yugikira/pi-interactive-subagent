@@ -1,7 +1,8 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, utimesSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { interpretExitSignal } from "../pi-extension/subagents/signals.ts";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -52,8 +53,8 @@ import {
   isSurfaceAlive,
   closeSurface,
   terminateSurface,
-  pollForExit,
-  __pollForExitTest__,
+  readCapturedOutput,
+  readCapturedOutputAsync,
   setHerdrExecDeps,
   parsePaneList,
   paneExists,
@@ -89,6 +90,11 @@ import {
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import { createFakeHerdr, herdrError, useEmptyFakeHerdr } from "./fake-herdr.ts";
 import { stopMonitor } from "../pi-extension/subagents/monitor-host.ts";
+import { buildPiResumeCommand } from "../pi-extension/subagents/runners/pi.ts";
+import { resolveSubagentPaths } from "../pi-extension/subagents/launch-config.ts";
+import { isDangerous } from "../pi-extension/subagents/tools/safe-bash.ts";
+import { CompletionController, completionPolicyFor } from "../pi-extension/subagents/completion.ts";
+import { steerSubagent } from "../pi-extension/subagents/controls.ts";
 
 // --- Helpers ---
 
@@ -1997,8 +2003,8 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("herdr.ts interpretExitSidecar", () => {
-  const { interpretExitSidecar } = __pollForExitTest__;
+describe("signals.ts interpretExitSignal", () => {
+  const interpretExitSidecar = interpretExitSignal;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
     // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
@@ -2041,26 +2047,6 @@ describe("herdr.ts interpretExitSidecar", () => {
   it("treats unknown payload shapes as done", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
-  });
-
-  it("pollForExit respects abort signal immediately", async () => {
-    const ac = new AbortController();
-    ac.abort();
-    await assert.rejects(
-      pollForExit("any-surface", ac.signal, { interval: 100 }),
-      /Aborted while waiting/,
-    );
-  });
-
-  it("pollForExit detects when surface is not alive after grace period", async () => {
-    if (!isHerdrAvailable()) return;
-    const ac = new AbortController();
-    const result = await pollForExit("nonexistent-surface-abc-xyz", ac.signal, {
-      interval: 100,
-    });
-    assert.equal(result.reason, "error");
-    assert.equal(result.exitCode, 1);
-    assert.match(result.errorMessage ?? "", /pane was closed/);
   });
 });
 describe("commands", () => {
@@ -4356,293 +4342,174 @@ describe("herdr.ts", () => {
     });
   });
 
-  describe("pollForExit debounce & settle verification", () => {
-    const { setAgentStateOverride, setSurfaceAliveOverride, setReadScreenOverride } = __pollForExitTest__ as any;
-
-    beforeEach(() => {
-      setAgentStateOverride(null);
-      setSurfaceAliveOverride(null);
-      setReadScreenOverride(() => "");
-    });
-
-    after(() => {
-      setAgentStateOverride(null);
-      setSurfaceAliveOverride(null);
-      setReadScreenOverride(null);
-    });
-
-    it("does not exit on a single transient idle tick; requires idleSettleCount consecutive idle checks", async () => {
-      setSurfaceAliveOverride(() => true);
-
-      // State sequence: working -> idle (1) -> idle (2) -> idle (3 -> done)
-      let tick = 0;
-      setAgentStateOverride(() => {
-        tick++;
-        if (tick === 1) return { name: "test", state: "working" };
-        return { name: "test", state: "idle" };
-      });
-
-      const ac = new AbortController();
-      const result = await pollForExit("dummy-surface", ac.signal, {
-        interval: 10,
-        agentName: "test",
-        runner: "agy",
-        idleSettleCount: 3,
-      });
-
-      assert.equal(result.reason, "done");
-      assert.equal(result.exitCode, 0);
-      assert.ok(tick >= 4, `expected at least 4 ticks (1 working + 3 idle), got ${tick}`);
-    });
-
-    it("resets idle streak when agent transitions back to working", async () => {
-      setSurfaceAliveOverride(() => true);
-
-      // Sequence: working -> idle (1) -> idle (2) -> working (reset!) -> idle (1) -> idle (2) -> idle (3 -> done)
-      let tick = 0;
-      setAgentStateOverride(() => {
-        tick++;
-        if (tick === 1) return { name: "test", state: "working" };
-        if (tick === 2 || tick === 3) return { name: "test", state: "idle" };
-        if (tick === 4) return { name: "test", state: "working" }; // interrupts idle streak
-        return { name: "test", state: "idle" };
-      });
-
-      const ac = new AbortController();
-      const result = await pollForExit("dummy-surface", ac.signal, {
-        interval: 10,
-        agentName: "test",
-        runner: "claude",
-        idleSettleCount: 3,
-      });
-
-      assert.equal(result.reason, "done");
-      assert.equal(result.exitCode, 0);
-      // tick 1 (working), 2 (idle 1), 3 (idle 2), 4 (working reset), 5 (idle 1), 6 (idle 2), 7 (idle 3 -> exit)
-      assert.ok(tick >= 7, `expected at least 7 ticks due to reset, got ${tick}`);
-    });
-
-    it("pi runner does not exit on Herdr idle state", async () => {
-      setSurfaceAliveOverride(() => true);
-
-      let tick = 0;
-      setAgentStateOverride(() => {
-        tick++;
-        if (tick === 1) return { name: "pi-agent", state: "working" };
-        // Continues in idle — Pi should NOT exit based on idle
-        return { name: "pi-agent", state: "idle" };
-      });
-
-      const ac = new AbortController();
-      // Abort after 50ms so the test doesn't loop infinitely
-      setTimeout(() => ac.abort(), 60);
-
-      await assert.rejects(
-        pollForExit("dummy-surface", ac.signal, {
-          interval: 10,
-          agentName: "pi-agent",
-          runner: "pi",
-          idleSettleCount: 2,
-        }),
-        /Aborted/,
-      );
-      assert.ok(tick >= 3, `Pi runner should have observed multiple idle ticks without exiting, got ${tick}`);
-    });
-
-    it("resets idle count when native transcript file was modified within 3 seconds", async () => {
-      setSurfaceAliveOverride(() => true);
-
-      const tempDir = mkdtempSync(join(tmpdir(), "agy-mtime-test-"));
+  describe("v4.0.1 code review bug fixes & regressions", () => {
+    it("buildPiResumeCommand re-enables third-party provider extensions under --no-extensions", () => {
+      const tempDir = createTestDir();
       try {
-        const convDir = join(tempDir, "conv-live", ".system_generated", "logs");
-        mkdirSync(convDir, { recursive: true });
-        const transcriptPath = join(convDir, "transcript.jsonl");
-        writeFileSync(transcriptPath, '{"step": 1}\n');
+        const npmDir = join(tempDir, "npm", "node_modules");
+        const pkgDir = join(npmDir, "pi-antigravity");
+        const extPath = join(pkgDir, "src", "index.ts");
+        mkdirSync(dirname(extPath), { recursive: true });
+        writeFileSync(
+          join(pkgDir, "package.json"),
+          JSON.stringify({ name: "pi-antigravity", pi: { extensions: ["./src/index.ts"] } }),
+        );
+        writeFileSync(extPath, "");
 
-        let tick = 0;
-        setAgentStateOverride(() => {
-          tick++;
-          if (tick === 1) return { name: "agy-agent", state: "working", sessionId: "conv-live" };
-          if (tick <= 3) {
-            // Touch the file on ticks 2 and 3 to simulate active streaming
-            writeFileSync(transcriptPath, `{"step": ${tick}}\n`);
-          }
-          return { name: "agy-agent", state: "idle", sessionId: "conv-live" };
+        const sessionFile = join(tempDir, "s.jsonl");
+        writeFileSync(sessionFile, "");
+        const loadout: SubagentLoadout = {
+          agent: "scout",
+          toolAllowlist: "read,write",
+          model: "antigravity/gemini-3.8-flash",
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: tempDir,
+          agentDir: tempDir,
+        };
+
+        const cmd = buildPiResumeCommand({
+          platform: "linux",
+          sessionFile,
+          sessionId: "abc",
+          launchArgs: null,
+          name: "scout",
+          id: "123",
+          message: "hello",
+          messageFile: null,
+          loadout,
+          autoExit: true,
+          agentDir: tempDir,
+          spawnable: null,
+          cwd: tempDir,
+          artifactDir: tempDir,
+          activityFile: join(tempDir, "act.json"),
+          subagentDonePath: "/done.ts",
         });
 
-        // Patch homedir / brainDir via getNativeSessionFile or direct file
-        // To test getNativeSessionFile with custom brainDir, we pass options or test through the mtime logic:
-        // Here we test that if the file is touched, polling extends.
-        const ac = new AbortController();
-        const result = await pollForExit("dummy-surface", ac.signal, {
-          interval: 15,
-          agentName: "agy-agent",
-          runner: "agy",
-          idleSettleCount: 2,
-        });
-
-        assert.equal(result.reason, "done");
-        assert.equal(result.exitCode, 0);
+        assert.ok(cmd, "command should be rendered");
+        assert.ok(cmd.includes("--no-extensions"), "should include --no-extensions");
+        assert.ok(cmd.includes(extPath), "should include provider extension path");
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
       }
     });
 
-    it("pi runner consumes a fresh .parked sidecar as turn completion", async () => {
-      setSurfaceAliveOverride(() => true);
-      // Idle throughout — the sidecar alone must complete, idle must not.
-      setAgentStateOverride(() => ({ name: "pi-agent", state: "idle" }));
+    it("resolveSubagentPaths handles Windows absolute and relative paths without mangling", () => {
+      const resolvedAbsWin = resolveSubagentPaths({ cwd: "D:\\repos\\app" }, null);
+      assert.equal(resolvedAbsWin.effectiveCwd, "D:\\repos\\app");
 
-      const dir = mkdtempSync(join(tmpdir(), "pi-parked-"));
+      const resolvedRel = resolveSubagentPaths({ cwd: "sub/dir" }, null);
+      assert.equal(resolvedRel.effectiveCwd, join(process.cwd(), "sub", "dir"));
+    });
+
+    it("safe_bash isDangerous blocks root/home destruction while allowing safe absolute/relative paths", () => {
+      // Dangerous patterns that must be blocked
+      assert.ok(isDangerous("rm -rf /"));
+      assert.ok(isDangerous("rm -rf /*"));
+      assert.ok(isDangerous("rm -rf ~"));
+      assert.ok(isDangerous("rm -rf ~/"));
+      assert.ok(isDangerous("rm -rf ~/*"));
+      assert.ok(isDangerous("rm -f -r /"));
+      assert.ok(isDangerous("rm -r -f ~"));
+      assert.ok(isDangerous("rm -rf '/'"));
+      assert.ok(isDangerous("rm -rf '~'"));
+      assert.ok(isDangerous("rm -rf / && echo done"));
+      assert.ok(isDangerous("rm -rf ~; echo done"));
+      assert.ok(isDangerous("sudo apt-get install"));
+      assert.ok(isDangerous("mkfs.ext4 /dev/sda1"));
+
+      // Safe commands that must be allowed
+      assert.equal(isDangerous("rm -f /tmp/foo.txt"), null);
+      assert.equal(isDangerous("rm -rf /var/log/app.log"), null);
+      assert.equal(isDangerous("rm -rf ./build"), null);
+      assert.equal(isDangerous("rm -rf tmp/cache"), null);
+      assert.equal(isDangerous("rm file.txt"), null);
+    });
+
+    it("readCapturedOutput prioritizes surface over agentName to avoid sibling pane collisions", () => {
+      const calls: string[] = [];
+      setHerdrExecDeps({
+        available: () => true,
+        run: (args) => {
+          calls.push(args.join(" "));
+          if (args[0] === "agent" && args[1] === "read" && args[2] === "pane-123") {
+            return "surface output";
+          }
+          if (args[0] === "agent" && args[1] === "read" && args[2] === "pi") {
+            return "parent orchestrator output";
+          }
+          return "";
+        },
+      });
+
       try {
-        const sessionFile = join(dir, "s.jsonl");
-        writeFileSync(sessionFile, "");
-        const turnStartTime = Date.now() - 5_000;
-        writeFileSync(
-          `${sessionFile}.parked`,
-          JSON.stringify({ parkedAt: Date.now(), name: "worker", agent: "worker" }),
-        );
-
-        const ac = new AbortController();
-        const result = await pollForExit("dummy-surface", ac.signal, {
-          interval: 10,
-          agentName: "pi-agent",
-          runner: "pi",
-          sessionFile,
-          turnStartTime,
-        });
-
-        assert.equal(result.reason, "done");
-        assert.equal(result.exitCode, 0);
-        assert.ok(!existsSync(`${sessionFile}.parked`), "consumed .parked must be deleted");
+        const out = readCapturedOutput("pane-123", "pi", 100);
+        assert.equal(out, "surface output");
+        // Verify surface was queried and parent 'pi' agent was not queried
+        assert.ok(calls.some((c) => c.includes("pane-123")));
+        assert.ok(!calls.some((c) => c.includes("agent read pi")));
       } finally {
-        rmSync(dir, { recursive: true, force: true });
+        setHerdrExecDeps(null as any);
       }
     });
 
-    it("drops a stale .parked sidecar from a previous turn and keeps polling", async () => {
-      setSurfaceAliveOverride(() => true);
-      setAgentStateOverride(() => ({ name: "pi-agent", state: "working" }));
+    it("steerSubagent preserves running.turn and resets completion controller state", () => {
+      const running = makeRunning({
+        turn: 2,
+        turnStartTime: 1000,
+        herdrAgentName: "child",
+      }) as any;
 
-      const dir = mkdtempSync(join(tmpdir(), "pi-parked-stale-"));
-      try {
-        const sessionFile = join(dir, "s.jsonl");
-        writeFileSync(sessionFile, "");
-        // Parked before the current turn started — a leftover, not this turn's result.
-        writeFileSync(`${sessionFile}.parked`, JSON.stringify({ parkedAt: Date.now() - 60_000 }));
+      let resetTime = 0;
+      running.completion = {
+        resetTurn: (t: number) => {
+          resetTime = t;
+        },
+      };
 
-        const ac = new AbortController();
-        const pending = pollForExit("dummy-surface", ac.signal, {
-          interval: 10,
-          agentName: "pi-agent",
-          runner: "pi",
-          sessionFile,
-          turnStartTime: Date.now() - 1_000,
-        });
-        await new Promise((r) => setTimeout(r, 80));
-        assert.ok(!existsSync(`${sessionFile}.parked`), "stale .parked must be consumed and dropped");
-        ac.abort();
-        await assert.rejects(pending, /Aborted/);
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
+      const outcome = steerSubagent(running, "follow-up message", () => {});
+      assert.equal("error" in outcome, false);
+      if ("ok" in outcome) {
+        assert.equal(outcome.ok, true);
       }
+      // Turn must NOT be double-incremented to 3
+      assert.equal(running.turn, 2);
+      assert.ok(resetTime > 0, "completion.resetTurn should have been invoked with timestamp");
+      assert.equal(running.turnStartTime, resetTime);
     });
 
-    it("consumes a fresh .exit error sidecar and reports the failure", async () => {
-      setSurfaceAliveOverride(() => true);
-      setAgentStateOverride(() => ({ name: "pi-agent", state: "working" }));
-
-      const dir = mkdtempSync(join(tmpdir(), "pi-exit-fresh-"));
+    it("readAgySession and parseClaudeTranscriptFile tolerate timestamps within 1000ms window", () => {
+      const tempDir = createTestDir();
       try {
-        const sessionFile = join(dir, "s.jsonl");
-        writeFileSync(sessionFile, "");
+        const convDir = join(tempDir, "conv-1", ".system_generated", "logs");
+        mkdirSync(convDir, { recursive: true });
+        const transcriptPath = join(convDir, "transcript.jsonl");
+
+        const turnStartMs = Date.parse("2026-10-30T10:00:05.750Z");
+        // Entry recorded with second precision (000ms), which is 750ms before turnStartMs
         writeFileSync(
-          `${sessionFile}.exit`,
+          transcriptPath,
           JSON.stringify({
-            type: "error",
-            errorMessage: "Anthropic 529 Overloaded",
-            writtenAt: Date.now(),
-          }),
+            step_index: 1,
+            source: "MODEL",
+            type: "PLANNER_RESPONSE",
+            content: "response in same second",
+            created_at: "2026-10-30T10:00:05.000Z",
+          }) + "\n",
         );
 
-        const ac = new AbortController();
-        const result = await pollForExit("dummy-surface", ac.signal, {
-          interval: 10,
-          agentName: "pi-agent",
-          runner: "pi",
-          sessionFile,
-          turnStartTime: Date.now() - 1_000,
+        const result = readAgySession({
+          brainDir: tempDir,
+          conversationId: "conv-1",
+          afterTimestamp: turnStartMs,
         });
-
-        assert.equal(result.reason, "error");
-        assert.equal(result.exitCode, 1);
-        assert.equal(result.errorMessage, "Anthropic 529 Overloaded");
-        assert.ok(!existsSync(`${sessionFile}.exit`), "consumed .exit must be deleted");
+        assert.equal(result, "response in same second", "should not drop entry in same wall-clock second");
       } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
-    });
-
-    it("ignores a stale .exit sidecar from a previous turn", async () => {
-      setSurfaceAliveOverride(() => true);
-      setAgentStateOverride(() => ({ name: "pi-agent", state: "working" }));
-
-      const dir = mkdtempSync(join(tmpdir(), "pi-exit-stale-"));
-      try {
-        const sessionFile = join(dir, "s.jsonl");
-        writeFileSync(sessionFile, "");
-        writeFileSync(
-          `${sessionFile}.exit`,
-          JSON.stringify({
-            type: "error",
-            errorMessage: "previous turn failure",
-            writtenAt: Date.now() - 60_000,
-          }),
-        );
-
-        const ac = new AbortController();
-        const pending = pollForExit("dummy-surface", ac.signal, {
-          interval: 10,
-          agentName: "pi-agent",
-          runner: "pi",
-          sessionFile,
-          turnStartTime: Date.now() - 1_000,
-        });
-        await new Promise((r) => setTimeout(r, 80));
-        assert.ok(!existsSync(`${sessionFile}.exit`), "stale .exit must be consumed and dropped");
-        ac.abort();
-        await assert.rejects(pending, /Aborted/);
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
-    });
-
-    it("accepts legacy .exit payloads without writtenAt (pre-freshness behavior)", async () => {
-      setSurfaceAliveOverride(() => true);
-      setAgentStateOverride(() => ({ name: "pi-agent", state: "working" }));
-
-      const dir = mkdtempSync(join(tmpdir(), "pi-exit-legacy-"));
-      try {
-        const sessionFile = join(dir, "s.jsonl");
-        writeFileSync(sessionFile, "");
-        writeFileSync(
-          `${sessionFile}.exit`,
-          JSON.stringify({ type: "error", errorMessage: "legacy payload" }),
-        );
-
-        const ac = new AbortController();
-        const result = await pollForExit("dummy-surface", ac.signal, {
-          interval: 10,
-          agentName: "pi-agent",
-          runner: "pi",
-          sessionFile,
-          turnStartTime: Date.now() - 1_000,
-        });
-
-        assert.equal(result.reason, "error");
-        assert.equal(result.errorMessage, "legacy payload");
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmSync(tempDir, { recursive: true, force: true });
       }
     });
   });

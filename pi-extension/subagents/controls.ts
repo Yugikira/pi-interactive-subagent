@@ -83,9 +83,10 @@ export function steerSubagent(
   send: (surface: string, command: string) => void = sendCommand,
 ): { ok: true } | { error: string } {
   try {
-    const nextTurn = (running.turn ?? 1) + 1;
-    running.turn = nextTurn;
-    running.turnStartTime = Date.now();
+    const nextTurn = running.turn ?? 1;
+    const now = Date.now();
+    running.turnStartTime = now;
+    running.completion?.resetTurn(now);
 
     if (
       running.herdrAgentName &&

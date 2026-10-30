@@ -8,6 +8,7 @@ import { resolveRunnerAndAgent } from "../launch-config.ts";
 import { ensureMonitorStarted, updateWidget } from "../monitor-host.ts";
 import { persistRunning } from "../name-registry.ts";
 import { getArtifactDir } from "../paths.ts";
+import { isKnownRunner, RUNNER_KINDS } from "../runner-kinds.ts";
 import { reservedNames } from "../runtime.ts";
 import { readNameRegistry } from "../session.ts";
 import { watchAndDeliver } from "../turn.ts";
@@ -35,6 +36,18 @@ export function registerSubagentTool(pi: ExtensionAPI): void {
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        if (params.cli && !isKnownRunner(params.cli)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Unknown runner CLI "${params.cli}". Supported runners: ${RUNNER_KINDS.join(", ")}.`,
+              },
+            ],
+            details: { error: "unknown runner cli" },
+          };
+        }
+
         const { effectiveRunner, agentName, agentDefs } = resolveRunnerAndAgent(params);
 
         // Prevent self-spawning (e.g. planner spawning another planner)
@@ -59,7 +72,20 @@ export function registerSubagentTool(pi: ExtensionAPI): void {
         const permittedList = permittedAgents.join(", ") || "(none)";
 
         // Strict whitelist at every depth.
-        if (agentName) {
+        if (allowlist !== null) {
+          if (!agentName) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `You are restricted to spawning specific agents via the "agent" field: ${permittedList}. ` +
+                    `Direct CLI runner launches are not permitted.`,
+                },
+              ],
+              details: { error: "agent required by allowlist" },
+            };
+          }
           if (!permittedSet.has(agentName)) {
             return {
               content: [
@@ -67,13 +93,24 @@ export function registerSubagentTool(pi: ExtensionAPI): void {
                   type: "text",
                   text:
                     `You may not spawn the "${agentName}" agent — it is not ` +
-                    `${allowlist ? "in your allowlist" : "a known agent"}. ` +
-                    `Available agents: ${permittedList}.`,
+                    `in your allowlist. Available agents: ${permittedList}.`,
                 },
               ],
-              details: {
-                error: allowlist ? "agent not in allowlist" : "unknown agent",
-              },
+              details: { error: "agent not in allowlist" },
+            };
+          }
+        } else if (agentName) {
+          if (!permittedSet.has(agentName)) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `You may not spawn the "${agentName}" agent — it is not ` +
+                    `a known agent. Available agents: ${permittedList}.`,
+                },
+              ],
+              details: { error: "unknown agent" },
             };
           }
         } else if (!params.cli && !params.agent) {

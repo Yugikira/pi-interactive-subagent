@@ -206,7 +206,7 @@ export class CompletionController {
   private rejectPromise!: (error: Error) => void;
   private finished = false;
   private readonly policy: CompletionPolicy;
-  private readonly turnStartTime: number;
+  private turnStartTime: number;
   private readonly onStall?: (elapsedMs: number) => void;
 
   constructor(
@@ -250,6 +250,17 @@ export class CompletionController {
     if (this.finished) return;
     this.finished = true;
     this.rejectPromise(new Error(message));
+  }
+
+  /**
+   * Reset completion state for a new turn steered into an already-running agent.
+   * Clears observed-working and idle streaks so idle checks do not settle the turn
+   * before the new prompt begins execution.
+   */
+  resetTurn(turnStartTime: number): void {
+    if (this.finished) return;
+    this.turnStartTime = turnStartTime;
+    this.state = createCompletionState(turnStartTime);
   }
 }
 

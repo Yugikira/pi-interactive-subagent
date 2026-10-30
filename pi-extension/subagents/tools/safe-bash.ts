@@ -9,9 +9,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
-const DANGEROUS_PATTERNS = [
-	/\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?(-[a-zA-Z]*r[a-zA-Z]*\s+)?(\/|~\/?\s|~\/?\b)/,
-	/\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?(-[a-zA-Z]*f[a-zA-Z]*\s+)?(\/|~\/?\s|~\/?\b)/,
+export const DANGEROUS_PATTERNS = [
+	/\brm\s+(?:-\S+\s+)*(?:-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(?:-\S+\s+)*['"]?(?:\/|\/\*|~|~\/|~\/\*)['"]?(?:\s|$|;|&|\|)/,
 	/\bsudo\b/,
 	/\bmkfs\b/,
 	/\bdd\s+if=/,
@@ -28,7 +27,7 @@ const DANGEROUS_PATTERNS = [
 	/\bkillall\b/,
 ];
 
-function isDangerous(command: string): string | null {
+export function isDangerous(command: string): string | null {
 	const normalized = command.replace(/\\\n/g, " ");
 	for (const pattern of DANGEROUS_PATTERNS) {
 		if (pattern.test(normalized)) {
@@ -39,8 +38,6 @@ function isDangerous(command: string): string | null {
 }
 
 export default function (pi: ExtensionAPI) {
-	const bashTool = createBashTool(process.cwd());
-
 	pi.registerTool({
 		name: "safe_bash",
 		label: "Safe Bash",
@@ -57,6 +54,7 @@ export default function (pi: ExtensionAPI) {
 			if (danger) {
 				throw new Error(danger);
 			}
+			const bashTool = createBashTool(ctx?.cwd ?? process.cwd());
 			return bashTool.execute(toolCallId, params, signal, onUpdate);
 		},
 	});

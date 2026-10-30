@@ -76,6 +76,8 @@ export function applySandboxToParts(
     escape?: boolean;
     platform?: NodeJS.Platform;
     resolveToolExtension?: (tool: string) => string | undefined;
+    providerExtensions?: string[];
+    fallbackModel?: string | null;
   },
 ): void {
   const esc = opts.escape !== false;
@@ -112,6 +114,23 @@ export function applySandboxToParts(
       const extPath = resolveToolExtension(tool);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
+
+    // `--no-extensions` also removes third-party model providers. If the resolved
+    // or inherited model belongs to one, re-enable just that provider extension
+    // so the child can resolve `--model`.
+    const provider = providerFromModel(loadout.model ?? opts.fallbackModel);
+    const npmDir = loadout.agentDir
+      ? join(loadout.agentDir, "npm", "node_modules")
+      : undefined;
+    const gitDir = loadout.agentDir
+      ? join(loadout.agentDir, "git")
+      : undefined;
+    const providerExtensions =
+      opts.providerExtensions ?? providerExtensionPaths(provider, npmDir, gitDir);
+    for (const ext of providerExtensions) {
+      extPaths.add(ext);
+    }
+
     for (const extPath of extPaths) {
       parts.push("-e", wrap(extPath));
     }
@@ -358,17 +377,9 @@ export function buildPiLaunch(
     artifactDir: ctx.artifactDir,
     name: ctx.displayName,
     escape: false,
+    providerExtensions: injectedProviderExtensions,
+    fallbackModel: ctx.model ?? ctx.parentModel,
   });
-
-  // `--no-extensions` also removes third-party model providers. If the
-  // resolved or inherited model belongs to one, re-enable just that provider
-  // extension so the child can resolve `--model`.
-  const provider = providerFromModel(ctx.model) ?? providerFromModel(ctx.parentModel);
-  const providerExtensions =
-    injectedProviderExtensions ?? providerExtensionPaths(provider);
-  for (const ext of providerExtensions) {
-    rawArgs.push("-e", ext);
-  }
 
   const taskArg = buildTaskArg(ctx);
   for (const promptArg of buildPiPromptArgs({

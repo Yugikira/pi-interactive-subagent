@@ -4,7 +4,7 @@
  * is started here; `launch.ts` consumes these decisions.
  */
 import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { getAgentConfigDir, loadAgentDefaults, type AgentDefaults, type SubagentSessionMode } from "./agents.ts";
 import { formatParentModel } from "./model-config.ts";
 import { normalizeRunner, type CanonicalRunner } from "./runners/registry.ts";
@@ -27,11 +27,7 @@ export function resolveSubagentPaths(
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
-  const effectiveCwd = rawCwd
-    ? rawCwd.startsWith("/")
-      ? rawCwd
-      : join(cwdBase, rawCwd)
-    : null;
+  const effectiveCwd = rawCwd ? resolve(cwdBase, rawCwd) : null;
   const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
   const effectiveAgentDir =
     localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();

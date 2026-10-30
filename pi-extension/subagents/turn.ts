@@ -9,11 +9,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { completionPolicyFor, CompletionController, type CompletionResult } from "./completion.ts";
 import { formatElapsed, resolveResultPresentation } from "./format.ts";
 import {
-  getAgentState,
+  getAgentStateAsync,
   paneExistsAsync,
-  readAgentOutput,
-  readScreen,
-  sanitizeTerminalOutput,
+  readCapturedOutput,
+  readCapturedOutputAsync,
   terminateSurface,
 } from "./herdr.ts";
 import { persistRunning } from "./name-registry.ts";
@@ -25,7 +24,7 @@ import {
   type RunningSubagent,
   type SubagentResult,
 } from "./runtime.ts";
-import { getSessionId, summarizeSessionStats } from "./session.ts";
+import { countSessionEntryLines, getSessionId, summarizeSessionStats } from "./session.ts";
 import type { AskSignal } from "./signals.ts";
 
 /**
@@ -93,13 +92,14 @@ export async function watchSubagent(
   const adapter = getRunner(cli) ?? getRunner("pi");
   if (!adapter) throw new Error(`Unknown runner adapter: ${cli}`);
   const deliveryTurn = running.turn ?? 1;
+  const turnStart = running.turnStartTime ?? startTime;
 
   try {
     // The shared monitor feeds this controller once per tick; the controller
     // itself owns no timer.
     const controller = new CompletionController(
       completionPolicyFor(adapter, { interactive: running.interactive }),
-      running.turnStartTime ?? startTime,
+      turnStart,
       (elapsedMs) => notifyStall(running, elapsedMs),
     );
     running.completion = controller;
@@ -116,7 +116,7 @@ export async function watchSubagent(
       running.completion = undefined;
     }
 
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const elapsed = Math.floor((Date.now() - turnStart) / 1000);
 
     // External runners (agy, claude, codex, grok, opencode)
     if (!adapter.supportsSessionStats) {
@@ -125,7 +125,7 @@ export async function watchSubagent(
       // Resolve session ID from Herdr if not already known
       let sessionRefId = running.sessionId;
       if (!sessionRefId && running.herdrAgentName) {
-        const stateInfo = getAgentState(running.herdrAgentName);
+        const stateInfo = await getAgentStateAsync(running.herdrAgentName);
         if (stateInfo?.sessionId) {
           sessionRefId = stateInfo.sessionId;
           running.sessionId = sessionRefId;
@@ -145,19 +145,12 @@ export async function watchSubagent(
           afterLine: running.resumeFromLine,
           sessionId: sessionRefId,
           agentName: herdrAgentName,
-          readPane: (lines) => sanitizeTerminalOutput(readAgentOutput(herdrAgentName, lines)),
+          readPane: (lines) => readCapturedOutput(surface, herdrAgentName, lines),
         })?.summary ?? "";
 
-      // 2. Fallback to reading agent output via Herdr with expanded buffer and sanitization
+      // 2. Fallback to reading captured output via Herdr
       if (!summary) {
-        summary = sanitizeTerminalOutput(readAgentOutput(herdrAgentName, 1000));
-      }
-
-      // 3. Fallback to reading the pane screen
-      if (!summary) {
-        summary = sanitizeTerminalOutput(
-          readScreen(surface, 1000).replace(/__SUBAGENT_DONE_\d+__/, "")
-        );
+        summary = await readCapturedOutputAsync(surface, herdrAgentName, 1000);
       }
 
       if (!summary) {
@@ -183,6 +176,9 @@ export async function watchSubagent(
           running.abortController = undefined;
           running.turn = (running.turn ?? 1) + 1;
           running.turnStartTime = Date.now();
+          if (existsSync(sessionFile)) {
+            running.resumeFromLine = countSessionEntryLines(sessionFile);
+          }
         }
       }
 
@@ -209,18 +205,13 @@ export async function watchSubagent(
           afterLine: running.resumeFromLine,
           sessionId: running.sessionId,
           agentName: herdrAgentName,
-          readPane: (lines) => sanitizeTerminalOutput(readAgentOutput(herdrAgentName, lines)),
+          readPane: (lines) => readCapturedOutput(surface, herdrAgentName, lines),
         })?.summary ?? "";
-      if (!summary) {
-        summary = result.errorMessage
-          ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
-            ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output";
-      }
-    } else {
+    }
+
+    if (!summary) {
       summary =
-        sanitizeTerminalOutput(readAgentOutput(herdrAgentName, 1000)) ||
+        (await readCapturedOutputAsync(surface, herdrAgentName, 1000)) ||
         (result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
           : result.exitCode !== 0
@@ -248,6 +239,9 @@ export async function watchSubagent(
         running.abortController = undefined;
         running.turn = (running.turn ?? 1) + 1;
         running.turnStartTime = Date.now();
+        if (existsSync(sessionFile)) {
+          running.resumeFromLine = countSessionEntryLines(sessionFile);
+        }
       }
     }
 
@@ -265,7 +259,22 @@ export async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    runningSubagents.delete(running.id);
+    if (getModuleAbortSignal().aborted && !signal.aborted) {
+      running.delivery = { turn: deliveryTurn, state: "suppressed" };
+      return {
+        name,
+        task,
+        summary: "Subagent watcher paused for module reload.",
+        exitCode: 0,
+        elapsed: Math.floor((Date.now() - turnStart) / 1000),
+        error: "reloaded",
+        cli: running.cli,
+      };
+    }
+
+    if (!running.interactive) {
+      runningSubagents.delete(running.id);
+    }
     running.delivery = { turn: deliveryTurn, state: "pending" };
 
     if (signal.aborted) {
@@ -275,7 +284,7 @@ export async function watchSubagent(
         task,
         summary: "Subagent cancelled.",
         exitCode: 1,
-        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        elapsed: Math.floor((Date.now() - turnStart) / 1000),
         error: "cancelled",
         sessionFile,
         cli: running.cli,
@@ -287,7 +296,7 @@ export async function watchSubagent(
       task,
       summary: `Subagent error: ${err?.message ?? String(err)}`,
       exitCode: 1,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
+      elapsed: Math.floor((Date.now() - turnStart) / 1000),
       error: err?.message ?? String(err),
       cli: running.cli,
     };

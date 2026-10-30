@@ -11,15 +11,8 @@ import { promisify } from "node:util";
 import { existsSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { getNativeSessionFile } from "./session.ts";
 import { shellEscape } from "./shell.ts";
-import type { CanonicalRunner } from "./runner-kinds.ts";
-import {
-  consumeExitSignal,
-  consumeParkedSignal,
-  interpretExitSignal,
-  isFreshSignal,
-} from "./signals.ts";
+import { isKnownRunner, type CanonicalRunner } from "./runner-kinds.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -790,17 +783,7 @@ export function terminateSurface(
   };
 }
 
-let surfaceAliveOverride: ((surface: string) => boolean) | null = null;
-
-/**
- * Check whether a pane surface still exists in Herdr.
- *
- * Only a confirmed absence returns false. A timed-out or unreadable inventory
- * is treated as "still there": `pane read` is slower than the inventory, and
- * treating its failure as death is what orphaned keepOpen panes.
- */
 export function isSurfaceAlive(surface: string): boolean {
-  if (surfaceAliveOverride) return surfaceAliveOverride(surface);
   return paneExists(surface) !== false;
 }
 
@@ -852,11 +835,8 @@ export function sendLongCommand(
   return scriptPath;
 }
 
-let readScreenOverride: ((surface: string, lines?: number) => string) | null = null;
-
 /** Read the screen contents of a pane (sync). */
 export function readScreen(surface: string, lines = 50): string {
-  if (readScreenOverride) return readScreenOverride(surface, lines);
   if (!isHerdrAvailable()) return "";
   try {
     return execHerdrSync([
@@ -875,7 +855,6 @@ export function readScreen(surface: string, lines = 50): string {
 
 /** Read the screen contents of a pane (async). */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
-  if (readScreenOverride) return readScreenOverride(surface, lines);
   if (!isHerdrAvailable()) return "";
   try {
     return await execHerdrAsync([
@@ -1004,8 +983,6 @@ export interface AgentInfo {
   raw?: any;
 }
 
-let agentStateOverride: ((target: string) => AgentInfo | null) | null = null;
-
 function parseAgentInfo(data: any, target: string): AgentInfo | null {
   const agent = data?.result?.agent ?? data?.agent ?? data?.result;
   if (!agent) return null;
@@ -1028,7 +1005,6 @@ function parseAgentInfo(data: any, target: string): AgentInfo | null {
  * Inspect the current state of an agent via `herdr agent get <target>`.
  */
 export function getAgentState(target: string): AgentInfo | null {
-  if (agentStateOverride) return agentStateOverride(target);
   if (!isHerdrAvailable()) return null;
   try {
     const raw = execHerdrSync(["agent", "get", target], { timeout: 3_000 });
@@ -1040,7 +1016,6 @@ export function getAgentState(target: string): AgentInfo | null {
 
 /** Async variant used by the 1 Hz monitor; never blocks the extension host. */
 export async function getAgentStateAsync(target: string): Promise<AgentInfo | null> {
-  if (agentStateOverride) return agentStateOverride(target);
   if (!isHerdrAvailable()) return null;
   try {
     const raw = await execHerdrAsync(["agent", "get", target], { timeout: 3_000 });
@@ -1148,214 +1123,38 @@ export function sendPaneKeys(surface: string, keys: string[]): void {
   parseHerdrResponse(raw, `herdr pane send-keys ${surface}`);
 }
 
-// ── Exit Polling ──
-
-export interface PollResult {
-  reason: "done" | "sentinel" | "error";
-  exitCode: number;
-  errorMessage?: string;
-}
-
-export function interpretExitSidecar(data: any): PollResult {
-  return interpretExitSignal(data);
-}
-
 /**
- * Whether a `.parked` signal counts for the current turn. Signals are
- * accepted only when written at or after the current turn started, so a
- * leftover from a previous turn can never be delivered as the current
- * turn's result (steer↔result stay 1:1).
+ * Read captured output from a subagent pane, prioritizing the unique pane
+ * surface over the runner name to avoid sibling pane collisions.
  */
-export function isFreshParkSignal(parkedAt: number, turnStartTime: number): boolean {
-  return isFreshSignal(parkedAt, turnStartTime);
-}
-
-/**
- * Read-and-consume the `.exit` signal. Kept as a thin alias while the legacy
- * poller is still in place; the codec itself lives in `signals.ts`.
- */
-export function consumeExitSidecar(sessionFile: string, turnStartTime: number): PollResult | null {
-  return consumeExitSignal(sessionFile, turnStartTime);
-}
-
-/**
- * Read-and-consume the `.parked` signal for a kept-open Pi turn.
- */
-export function consumeParkedSidecar(sessionFile: string, turnStartTime: number): PollResult | null {
-  return consumeParkedSignal(sessionFile, turnStartTime);
-}
-
-export const __pollForExitTest__ = {
-  interpretExitSidecar,
-  setAgentStateOverride: (fn: ((target: string) => AgentInfo | null) | null) => {
-    agentStateOverride = fn;
-  },
-  setSurfaceAliveOverride: (fn: ((surface: string) => boolean) | null) => {
-    surfaceAliveOverride = fn;
-  },
-  setReadScreenOverride: (fn: ((surface: string, lines?: number) => string) | null) => {
-    readScreenOverride = fn;
-  },
-};
-
-export interface PollForExitOptions {
-  interval: number;
-  sessionFile?: string;
-  sentinelFile?: string;
-  agentName?: string;
-  runner?: CanonicalRunner;
-  cwd?: string;
-  /**
-   * Lower bound (ms epoch) for one-shot sidecar signals to count as fresh —
-   * the start of the current turn. Signals written before it are leftovers
-   * from an earlier turn and are dropped, keeping steer↔result 1:1.
-   */
-  turnStartTime?: number;
-  idleSettleCount?: number;
-  onTick?: (elapsed: number) => void;
-}
-
-/**
- * Poll until the subagent exits or completes its active turn.
- * Uses Herdr's agent lifecycle tracking + file sidecars.
- */
-export async function pollForExit(
-  surface: string,
-  signal: AbortSignal,
-  options: PollForExitOptions,
-): Promise<PollResult> {
-  const start = Date.now();
-  let hasObservedWorking = false;
-  let consecutiveIdleCount = 0;
-  let consecutiveNullCount = 0;
-  const IDLE_SETTLE_COUNT = options.idleSettleCount ?? 3;
-
-  // One-shot sidecar signals written by the Pi child extension next to its
-  // session file: `.exit` (errored turn, any mode) and `.parked` (genuine
-  // turn end in a kept-open session — the Pi runner's completion signal,
-  // since Herdr "idle" is never trusted for Pi). Each is consumed at most
-  // once; stale leftovers are dropped.
-  const checkSidecars = (): PollResult | null => {
-    if (!options.sessionFile) return null;
-    const turnStartTime = options.turnStartTime ?? 0;
-    const exitResult = consumeExitSidecar(options.sessionFile, turnStartTime);
-    if (exitResult) return exitResult;
-    if (options.runner === "pi") {
-      return consumeParkedSidecar(options.sessionFile, turnStartTime);
-    }
-    return null;
-  };
-
-  for (;;) {
-    if (signal.aborted) {
-      throw new Error("Aborted while waiting for subagent to finish");
-    }
-
-    // Surface liveness check: detect if pane was closed by user or exited
-    if (isHerdrAvailable() && !isSurfaceAlive(surface) && Date.now() - start > 1000) {
-      return {
-        reason: hasObservedWorking ? "done" : "error",
-        exitCode: hasObservedWorking ? 0 : 1,
-        errorMessage: hasObservedWorking ? undefined : "Subagent pane was closed.",
-      };
-    }
-
-    // Fast path: one-shot sidecar signals (.exit / .parked)
-    const sidecarResult = checkSidecars();
-    if (sidecarResult) return sidecarResult;
-
-    // Check sentinel file if specified (e.g. Claude stop hook)
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
-      } catch {}
-    }
-
-    // Agent state tracking via Herdr
-    if (options.agentName) {
-      const stateInfo = getAgentState(options.agentName);
-      if (stateInfo) {
-        consecutiveNullCount = 0;
-        if (stateInfo.state === "working") {
-          hasObservedWorking = true;
-          consecutiveIdleCount = 0;
-        } else if (stateInfo.state === "done") {
-          return { reason: "done", exitCode: 0 };
-        } else if (hasObservedWorking && stateInfo.state === "idle") {
-          // For Pi runner: Herdr's screen detector seeing "idle" does NOT mean completion.
-          // Pi subagents are autonomous processes that terminate via ctx.shutdown() when finished,
-          // which shuts down the process / closes the pane. While Pi is running, "idle" simply means
-          // it is waiting (e.g. for child subagents like scout/researcher, ask_question reply, or tool execution).
-          // A session that parks at a genuine turn end instead announces it explicitly via the
-          // `.parked` sidecar (consumed by checkSidecars above) — the only turn-level completion
-          // signal for Pi, so `runner !== "pi"` stays correct here.
-          if (options.runner !== "pi") {
-            let isActivelyWriting = false;
-            if (options.runner === "agy" || options.runner === "claude") {
-              try {
-                const nativeFile = getNativeSessionFile({
-                  runner: options.runner,
-                  sessionId: stateInfo.sessionId,
-                  cwd: options.cwd,
-                });
-                if (nativeFile && existsSync(nativeFile)) {
-                  const mtime = statSync(nativeFile).mtimeMs;
-                  if (Date.now() - mtime < 3000) {
-                    isActivelyWriting = true;
-                  }
-                }
-              } catch {}
-            }
-
-            if (isActivelyWriting) {
-              consecutiveIdleCount = 0;
-            } else {
-              consecutiveIdleCount++;
-              if (consecutiveIdleCount >= IDLE_SETTLE_COUNT) {
-                return { reason: "done", exitCode: 0 };
-              }
-            }
-          }
-        }
-      } else if (hasObservedWorking) {
-        consecutiveNullCount++;
-        if (consecutiveNullCount >= 2 || !isSurfaceAlive(surface)) {
-          // Agent was running and has now exited/cleared from the pane
-          return { reason: "done", exitCode: 0 };
-        }
-      }
-    }
-
-    // Terminal sentinel screen check (fallback for Pi CLI exit marker)
-    try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-      }
-    } catch {
-      // Transient error reading screen or pane is initializing — sidecar
-      // signals may still be readable even when the screen isn't.
-      const sidecarResult = checkSidecars();
-      if (sidecarResult) return sidecarResult;
-    }
-
-    const elapsed = Math.floor((Date.now() - start) / 1000);
-    options.onTick?.(elapsed);
-
-    await new Promise<void>((resolve, reject) => {
-      if (signal.aborted) return reject(new Error("Aborted"));
-      const timer = setTimeout(() => {
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      }, options.interval);
-      function onAbort() {
-        clearTimeout(timer);
-        reject(new Error("Aborted"));
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
+export function readCapturedOutput(surface: string, agentName?: string, lines = 1000): string {
+  let raw = "";
+  if (surface) {
+    raw = readAgentOutput(surface, lines);
   }
+  if (!raw && agentName && (!surface || !isKnownRunner(agentName))) {
+    raw = readAgentOutput(agentName, lines);
+  }
+  if (!raw && surface) {
+    raw = readScreen(surface, lines);
+  }
+  return sanitizeTerminalOutput(raw);
+}
+
+export async function readCapturedOutputAsync(
+  surface: string,
+  agentName?: string,
+  lines = 1000,
+): Promise<string> {
+  let raw = "";
+  if (surface) {
+    raw = await readAgentOutputAsync(surface, lines);
+  }
+  if (!raw && agentName && (!surface || !isKnownRunner(agentName))) {
+    raw = await readAgentOutputAsync(agentName, lines);
+  }
+  if (!raw && surface) {
+    raw = await readScreenAsync(surface, lines);
+  }
+  return sanitizeTerminalOutput(raw);
 }

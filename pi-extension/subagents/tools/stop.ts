@@ -46,7 +46,7 @@ export function registerStopTool(pi: ExtensionAPI): void {
 
     renderResult(result, _opts, theme) {
       const details = result.details as any;
-      if (details?.stopped) {
+      if (details?.stopped || details?.warning) {
         const label = theme.fg("toolTitle", theme.bold(details.name ?? "subagent"));
         return new Text(
           details.warning
@@ -152,7 +152,7 @@ export function registerStopTool(pi: ExtensionAPI): void {
           },
         ],
         details: {
-          stopped: true,
+          stopped: !failed,
           name: target.name,
           id: target.id,
           paneClosed: outcome.paneClosed,
