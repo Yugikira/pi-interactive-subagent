@@ -30,6 +30,9 @@ All notable changes to `interactive-subagents` will be documented in this file.
   per-turn elapsed time**; direct input in a kept-open pane re-arms the watcher,
   and mid-turn steering resets the completion controller instead of settling
   early.
+- **Keep-open panes survive a cancelled or failed turn.** A keepOpen subagent is
+  interrupted in place (the pane stays open for inspection) instead of being
+  closed, and its watcher is re-armed for the next turn.
 - **`/reload` keeps running watchers and status monitoring alive**; the shared
   runtime maps survive module reloads and a reload no longer turns active
   subagents into cancellation errors.

@@ -58,7 +58,7 @@ import {
   resolveRunnerAndAgent,
 } from "./launch-config.ts";
 import { launchSubagent, paneShowsAgent } from "./launch.ts";
-import { claimDelivery } from "./turn.ts";
+import { claimDelivery, watchSubagent } from "./turn.ts";
 import {
   defaultInterrupt,
   handleSubagentInterrupt,
@@ -139,6 +139,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   defaultInterrupt,
   claimDelivery,
+  watchSubagent,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,

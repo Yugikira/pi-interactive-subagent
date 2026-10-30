@@ -4271,6 +4271,78 @@ describe("herdr.ts", () => {
         testApi.runningSubagents.clear();
       }
     });
+
+    it("watchSubagent preserves keepOpen pane when the turn is aborted", async () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+
+      const world = createFakeHerdr({ "pane-keep": { agent: "keep-bot" } }, {
+        agentNames: ["keep-bot"],
+      });
+      const restoreHerdr = setHerdrExecDeps(world.deps);
+
+      try {
+        const ac = new AbortController();
+        const running = makeRunning({
+          id: "keep-1",
+          name: "keep-bot",
+          surface: "pane-keep",
+          cli: "pi",
+          interactive: true,
+          herdrAgentName: "keep-bot",
+        });
+        runningMap.set("keep-1", running);
+
+        ac.abort();
+        const result = await testApi.watchSubagent(running, ac.signal);
+
+        assert.equal(result.summary, "Subagent cancelled.");
+        assert.equal(world.panes.has("pane-keep"), true);
+        assert.ok(
+          !world.calls.some(
+            (call: string[]) => call[0] === "pane" && call[1] === "close" && call[2] === "pane-keep",
+          ),
+          "pane close should not be called for keepOpen turn error",
+        );
+      } finally {
+        restoreHerdr();
+        runningMap.clear();
+      }
+    });
+
+    it("watchSubagent closes non-keepOpen pane when the turn is aborted", async () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+
+      const world = createFakeHerdr({ "pane-close": { agent: "close-bot" } }, {
+        agentNames: ["close-bot"],
+      });
+      const restoreHerdr = setHerdrExecDeps(world.deps);
+
+      try {
+        const ac = new AbortController();
+        const running = makeRunning({
+          id: "close-1",
+          name: "close-bot",
+          surface: "pane-close",
+          cli: "pi",
+          interactive: false,
+          herdrAgentName: "close-bot",
+        });
+        runningMap.set("close-1", running);
+
+        ac.abort();
+        const result = await testApi.watchSubagent(running, ac.signal);
+
+        assert.equal(result.summary, "Subagent cancelled.");
+        assert.equal(world.panes.has("pane-close"), false);
+      } finally {
+        restoreHerdr();
+        runningMap.clear();
+      }
+    });
   });
 
   describe("agent registration by pane kind", () => {

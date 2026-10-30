@@ -42,6 +42,10 @@ export interface FakeHerdrOptions {
   agentStatus?: string;
   /** Make every `agent start` fail (for failure-path tests). */
   startFails?: boolean;
+  /** Scripted pane screen output keyed by pane ID or function. */
+  paneOutput?: Record<string, string> | ((paneId: string) => string);
+  /** Scripted agent terminal output keyed by target or function. */
+  agentOutput?: Record<string, string> | ((target: string) => string);
 }
 
 export function herdrError(code: string, message: string): string {
@@ -145,6 +149,25 @@ export function createFakeHerdr(
     }
 
     if (group === "pane" && verb === "read") {
+      const paneId = args[2];
+      if (typeof options?.paneOutput === "function") return options.paneOutput(paneId);
+      if (options?.paneOutput && typeof options.paneOutput === "object") {
+        return options.paneOutput[paneId] ?? "";
+      }
+      return "";
+    }
+
+    if (group === "agent" && verb === "read") {
+      const target = args[2];
+      const agent = agents.get(target);
+      const pane = panes.get(target);
+      if (!agent && !pane && !extraAgentNames.has(target)) {
+        throw new Error(herdrError("agent_not_found", `agent target ${target} not found`));
+      }
+      if (typeof options?.agentOutput === "function") return options.agentOutput(target);
+      if (options?.agentOutput && typeof options.agentOutput === "object") {
+        return options.agentOutput[target] ?? "";
+      }
       return "";
     }
 

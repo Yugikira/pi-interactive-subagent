@@ -45,6 +45,7 @@ export const agyAdapter: RunnerAdapter = {
       agentName: ctx.agentName,
       sessionId: ctx.sessionId,
       afterTimestamp: ctx.turnStartTime,
+      brainDir: ctx.brainDir,
     });
     return summary ? { summary } : null;
   },

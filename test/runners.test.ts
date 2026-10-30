@@ -19,6 +19,8 @@ import {
 } from "../pi-extension/subagents/runners/pi.ts";
 import { agyAdapter } from "../pi-extension/subagents/runners/agy.ts";
 import { claudeAdapter } from "../pi-extension/subagents/runners/claude.ts";
+import { toClaudeProjectSlug } from "../pi-extension/subagents/session.ts";
+import { readCapturedOutput, setHerdrExecDeps } from "../pi-extension/subagents/herdr.ts";
 import type {
   RunnerLaunchContext,
   RunnerResultContext,
@@ -388,6 +390,108 @@ describe("adapter result extraction", () => {
       ),
       { summary: "codex done" },
     );
+  });
+
+  it("extracts the last Claude assistant message from project transcript", () => {
+    const projectsDir = join(dir, "projects");
+    const cwd = join(dir, "workspace");
+    const slug = toClaudeProjectSlug(cwd);
+    const projDir = join(projectsDir, slug);
+    mkdirSync(projDir, { recursive: true });
+
+    const sessionFile = join(projDir, "claude-session-1.jsonl");
+    writeFileSync(
+      sessionFile,
+      [
+        JSON.stringify({
+          type: "user",
+          timestamp: new Date().toISOString(),
+          message: { role: "user", content: "hello" },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          timestamp: new Date().toISOString(),
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Claude final answer" }],
+          },
+        }),
+      ].join("\n") + "\n",
+    );
+
+    const ctx = makeResultCtx({ cwd, sessionId: "claude-session-1", projectsDir });
+    assert.deepEqual(claudeAdapter.extractResult(ctx), { summary: "Claude final answer" });
+  });
+
+  it("returns null for a missing Claude session", () => {
+    assert.equal(claudeAdapter.extractResult(makeResultCtx({ projectsDir: join(dir, "empty") })), null);
+  });
+
+  it("extracts the last Agy assistant message from brain transcript", () => {
+    const brainDir = join(dir, "brain");
+    const convDir = join(brainDir, "conv-1", ".system_generated", "logs");
+    mkdirSync(convDir, { recursive: true });
+
+    const transcriptFile = join(convDir, "transcript.jsonl");
+    writeFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({ step: 1, source: "USER", content: "task" }),
+        JSON.stringify({
+          step: 2,
+          source: "MODEL",
+          created_at: new Date().toISOString(),
+          content: "Agy final answer",
+        }),
+      ].join("\n") + "\n",
+    );
+
+    const ctx = makeResultCtx({ sessionId: "conv-1", brainDir });
+    assert.deepEqual(agyAdapter.extractResult(ctx), { summary: "Agy final answer" });
+  });
+
+  it("returns null for a missing Agy session", () => {
+    assert.equal(agyAdapter.extractResult(makeResultCtx({ brainDir: join(dir, "empty") })), null);
+  });
+
+  it("readCapturedOutput prefers surface output, then agent output, then the screen", () => {
+    let callHistory: string[][] = [];
+    const restore = setHerdrExecDeps({
+      available: () => true,
+      run: (args) => {
+        callHistory.push(args);
+        if (args[0] === "agent" && args[1] === "read" && args[2] === "surface-pane") {
+          return "raw surface text\n__SUBAGENT_DONE_0__\n> ";
+        }
+        if (args[0] === "agent" && args[1] === "read" && args[2] === "named-agent") {
+          return "raw agent text\n__SUBAGENT_DONE_0__\n> ";
+        }
+        if (args[0] === "pane" && args[1] === "read") {
+          return "\x1b[32mcolor screen text\x1b[0m\n__SUBAGENT_DONE_0__\n> ";
+        }
+        throw new Error("not found");
+      },
+      runAsync: async (args) => "",
+    });
+
+    try {
+      // 1. The unique surface wins when it has output.
+      callHistory = [];
+      assert.equal(readCapturedOutput("surface-pane", "named-agent"), "raw surface text");
+      assert.equal(callHistory[0][2], "surface-pane");
+
+      // 2. Fall back to the agent name when the surface read is empty.
+      callHistory = [];
+      assert.equal(readCapturedOutput("empty-pane", "named-agent"), "raw agent text");
+      assert.ok(callHistory.some((c) => c[2] === "named-agent"));
+
+      // 3. Fall back to the screen when both structured reads are empty.
+      callHistory = [];
+      assert.equal(readCapturedOutput("empty-pane", "missing-agent"), "color screen text");
+      assert.ok(callHistory.some((c) => c[0] === "pane" && c[1] === "read"));
+    } finally {
+      restore();
+    }
   });
 });
 
