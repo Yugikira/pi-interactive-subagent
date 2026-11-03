@@ -92,7 +92,11 @@ async function finalizeTurnCleanup(
 ): Promise<void> {
   if (!running.interactive) {
     await new Promise((r) => setTimeout(r, 500));
-    terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
+    terminateSurface(surface, {
+      agentName: herdrAgentName,
+      herdrRegistered: running.herdrRegistered,
+      closePane: true,
+    });
     runningSubagents.delete(running.id);
   } else {
     // A keepOpen turn is over, but its pane is the only handle the user has.
@@ -121,6 +125,13 @@ export async function watchSubagent(
   if (!adapter) throw new Error(`Unknown runner adapter: ${cli}`);
   const deliveryTurn = running.turn ?? 1;
   const turnStart = running.turnStartTime ?? startTime;
+  // The Pi shell fallback runs without a Herdr registration. Reading or
+  // resolving state by that name could hit an unrelated live agent that owns
+  // it, so those paths target the pane instead.
+  const captureAgentName =
+    running.herdrRegistered === false ? undefined : herdrAgentName;
+  const stateTarget =
+    running.herdrRegistered === false ? surface : herdrAgentName;
 
   try {
     // The shared monitor feeds this controller once per tick; the controller
@@ -152,8 +163,8 @@ export async function watchSubagent(
 
       // Resolve session ID from Herdr if not already known
       let sessionRefId = running.sessionId;
-      if (!sessionRefId && running.herdrAgentName) {
-        const stateInfo = await getAgentStateAsync(running.herdrAgentName);
+      if (!sessionRefId && stateTarget) {
+        const stateInfo = await getAgentStateAsync(stateTarget);
         if (stateInfo?.sessionId) {
           sessionRefId = stateInfo.sessionId;
           running.sessionId = sessionRefId;
@@ -173,12 +184,12 @@ export async function watchSubagent(
           afterLine: running.resumeFromLine,
           sessionId: sessionRefId,
           agentName: herdrAgentName,
-          readPane: (lines) => readCapturedOutput(surface, herdrAgentName, lines),
+          readPane: (lines) => readCapturedOutput(surface, captureAgentName, lines),
         })?.summary ?? "";
 
       // 2. Fallback to reading captured output via Herdr
       if (!summary) {
-        summary = await readCapturedOutputAsync(surface, herdrAgentName, 1000);
+        summary = await readCapturedOutputAsync(surface, captureAgentName, 1000);
       }
 
       if (!summary) {
@@ -213,7 +224,7 @@ export async function watchSubagent(
           afterLine: running.resumeFromLine,
           sessionId: running.sessionId,
           agentName: herdrAgentName,
-          readPane: (lines) => readCapturedOutput(surface, herdrAgentName, lines),
+          readPane: (lines) => readCapturedOutput(surface, captureAgentName, lines),
         })?.summary ?? "";
     }
 
@@ -223,7 +234,7 @@ export async function watchSubagent(
       summary =
         (result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
-          : (await readCapturedOutputAsync(surface, herdrAgentName, 50)) ||
+          : (await readCapturedOutputAsync(surface, captureAgentName, 50)) ||
             (result.exitCode !== 0
               ? `Sub-agent exited with code ${result.exitCode}`
               : "Sub-agent exited without output"));
@@ -265,10 +276,18 @@ export async function watchSubagent(
 
     if (!running.interactive) {
       runningSubagents.delete(running.id);
-      terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
+      terminateSurface(surface, {
+        agentName: herdrAgentName,
+        herdrRegistered: running.herdrRegistered,
+        closePane: true,
+      });
     } else {
       // For keepOpen subagents, halt runaway execution but keep the pane for inspection
-      terminateSurface(surface, { agentName: herdrAgentName, closePane: false });
+      terminateSurface(surface, {
+        agentName: herdrAgentName,
+        herdrRegistered: running.herdrRegistered,
+        closePane: false,
+      });
       const stillThere = await paneExistsAsync(surface);
       if (stillThere === false) {
         runningSubagents.delete(running.id);

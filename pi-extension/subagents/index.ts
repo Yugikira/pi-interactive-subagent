@@ -11,7 +11,12 @@ import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { terminateSurface, sanitizeAgentName, setHerdrLogSink } from "./herdr.ts";
+import {
+  terminateSurface,
+  sanitizeAgentName,
+  setHerdrLogSink,
+  listLiveAgentNames,
+} from "./herdr.ts";
 import { isKnownRunner, normalizeRunner, RUNNER_KINDS } from "./runners/registry.ts";
 import {
   applySandboxToParts,
@@ -24,6 +29,7 @@ import { getToolExtensionPath } from "./tool-extensions.ts";
 import {
   MONITOR_KEY,
   POLL_ABORT_KEY,
+  reservedHerdrNames,
   reservedNames,
   runningSubagents,
   setLatestApi,
@@ -57,7 +63,7 @@ import {
   resolveResumeLaunchBehavior,
   resolveRunnerAndAgent,
 } from "./launch-config.ts";
-import { launchSubagent, paneShowsAgent } from "./launch.ts";
+import { launchSubagent, paneShowsAgent, pickHerdrAgentName } from "./launch.ts";
 import { claimDelivery, watchSubagent } from "./turn.ts";
 import {
   defaultInterrupt,
@@ -118,6 +124,8 @@ export const __test__ = {
   resolveRunnerAndAgent,
   parentModelForRunner,
   paneShowsAgent,
+  pickHerdrAgentName,
+  listLiveAgentNames,
   normalizeRunner,
   isKnownRunner,
   RUNNER_KINDS,
@@ -134,6 +142,7 @@ export const __test__ = {
   resolveRunningByName,
   uniqueRunningName,
   reservedNames,
+  reservedHerdrNames,
   steerSubagent,
   handleSubagentSteer,
   handleSubagentInterrupt,
@@ -204,7 +213,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       if (shutdownSessionId && agent.parentSessionId && agent.parentSessionId !== shutdownSessionId) {
         continue;
       }
-      terminateSurface(agent.surface, { agentName: agent.herdrAgentName, closePane: true });
+      terminateSurface(agent.surface, {
+        agentName: agent.herdrAgentName,
+        herdrRegistered: agent.herdrRegistered,
+        closePane: true,
+      });
       agent.abortController?.abort();
       runningSubagents.delete(id);
     }

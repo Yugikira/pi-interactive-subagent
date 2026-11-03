@@ -13,6 +13,7 @@ import {
   currentPaneId,
   getAgentStateAsync,
   getTabLayoutAsync,
+  listLiveAgentNames,
   listPanesAsync,
   promptAgentAsync,
   readScreenAsync,
@@ -38,7 +39,12 @@ import { persistRunning } from "./name-registry.ts";
 import { chooseSplitTarget, resolveSubagentLayout } from "./layout.ts";
 import { formatParentModel, resolveModel } from "./model-config.ts";
 import { getArtifactDir, SUBAGENTS_DIR } from "./paths.ts";
-import { runningSubagents, trackedSurfaces, type RunningSubagent } from "./runtime.ts";
+import {
+  reservedHerdrNames,
+  runningSubagents,
+  trackedSurfaces,
+  type RunningSubagent,
+} from "./runtime.ts";
 import { buildSubagentToolAllowlist } from "./runners/pi.ts";
 import { getRunner } from "./runners/registry.ts";
 import type { CanonicalRunner } from "./runner-kinds.ts";
@@ -46,6 +52,7 @@ import { createStatusState } from "./status.ts";
 import {
   countSessionEntryLines,
   getSessionId,
+  readNameRegistry,
   readSubagentLoadout,
   seedSubagentSessionFile,
   writeSubagentLoadout,
@@ -90,6 +97,47 @@ export function paneShowsAgent(
   kind: string,
 ): boolean {
   return pane.agent === name || pane.agent === kind;
+}
+
+const MAX_HERDR_NAME_LENGTH = 32;
+const MAX_HERDR_NAME_ATTEMPTS = 5;
+
+function isHerdrNameTaken(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /agent_name_taken/i.test(message);
+}
+
+/** Truncate `base` just enough to append `-<n>` within Herdr's 32-char limit. */
+function suffixedHerdrName(base: string, n: number): string {
+  const suffix = `-${n}`;
+  return `${base.slice(0, Math.max(1, MAX_HERDR_NAME_LENGTH - suffix.length))}${suffix}`;
+}
+
+/**
+ * Pick a Herdr name that is not in `taken`.
+ *
+ * Herdr names are unique across the whole server, so callers pass both names
+ * claimed by this session and names reported by the live-agent inventory.
+ */
+export function pickHerdrAgentName(base: string, taken: ReadonlySet<string>): string {
+  if (!taken.has(base)) return base;
+  for (let n = 2; n < 10_000; n++) {
+    const candidate = suffixedHerdrName(base, n);
+    if (!taken.has(candidate)) return candidate;
+  }
+  throw new Error(`No available Herdr agent name derived from "${base}"`);
+}
+
+/** Herdr names already claimed by this process or this spawner session. */
+function sessionHerdrNames(artifactDir: string): Set<string> {
+  const taken = new Set<string>(reservedHerdrNames);
+  for (const running of runningSubagents.values()) {
+    if (running.herdrAgentName) taken.add(running.herdrAgentName);
+  }
+  for (const entry of Object.values(readNameRegistry(artifactDir))) {
+    if (entry.herdrAgentName) taken.add(entry.herdrAgentName);
+  }
+  return taken;
 }
 
 /**
@@ -156,7 +204,11 @@ async function startAgentWithReadiness(
       }
       lastError = startError;
       // Argument/shape/busy errors are deterministic; retrying cannot fix them.
-      if (/invalid_agent_argument|unknown option|invalid .*argument|agent_pane_busy/i.test(message)) {
+      if (
+        /invalid_agent_argument|unknown option|invalid .*argument|agent_pane_busy|agent_name_taken/i.test(
+          message,
+        )
+      ) {
         throw startError;
       }
     } else {
@@ -339,6 +391,7 @@ export interface RunningSubagentInput {
   name: string;
   parentSessionId?: string;
   herdrAgentName: string;
+  herdrRegistered?: boolean;
   task: string;
   agent?: string;
   cli: CanonicalRunner;
@@ -362,6 +415,9 @@ export interface RunningSubagentInput {
 export function createRunningSubagent(input: RunningSubagentInput): RunningSubagent {
   return {
     ...input,
+    ...(input.herdrRegistered !== undefined
+      ? { herdrRegistered: input.herdrRegistered }
+      : {}),
     turn: input.turn ?? 1,
     turnStartTime: input.turnStartTime ?? input.startTime,
     statusState: createStatusState({
@@ -432,7 +488,7 @@ export async function launchSubagent(
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   const displayName = params.name || agentName || effectiveRunner;
-  const herdrAgentName = sanitizeAgentName(displayName);
+  const baseHerdrName = sanitizeAgentName(displayName);
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
@@ -488,34 +544,6 @@ export async function launchSubagent(
     writeSubagentLoadout(subagentSessionFile, loadout);
   }
 
-  const plan = adapter.buildLaunch({
-    platform: process.platform,
-    id,
-    displayName,
-    herdrAgentName,
-    task: params.task,
-    taskDelivery: launchBehavior.taskDelivery,
-    cwd: targetCwdForSession,
-    model: effectiveModel ?? null,
-    parentModel: formatParentModel(ctx.model),
-    thinking: effectiveThinking ?? null,
-    agentName: agentName ?? null,
-    agent: agentDefs,
-    loadout,
-    artifactDir,
-    sessionFile: subagentSessionFile,
-    activityFile,
-    subagentDonePath: join(SUBAGENTS_DIR, "subagent-done.ts"),
-    autoExit: childAutoExit,
-    interactive: effectiveInteractive,
-    spawnable: agentDefs?.subagentAgents ?? null,
-    agentDir: resolvedAgentDir,
-    effectiveTools,
-    effectiveSkills,
-    grantSpawning,
-    fullTask,
-  });
-
   // Use a pre-created surface (parallel mode) or create one with the complete
   // pane env. Every runner now gets the same env, including the spawn
   // allowlist and agent dir on the normal startAgent path.
@@ -534,7 +562,76 @@ export async function launchSubagent(
       ? join(artifactDir, "subagent-scripts", `${safeName || "subagent"}-${id}.${ext}`)
       : undefined;
 
+  // Reserve the Herdr name synchronously, before the first await: parallel
+  // spawns run their synchronous prefix before any of them can register in
+  // `runningSubagents`. The base name is only a starting point; another
+  // session may already own it on this Herdr server.
+  let herdrAgentName = pickHerdrAgentName(baseHerdrName, sessionHerdrNames(artifactDir));
+  reservedHerdrNames.add(herdrAgentName);
+  let reservedHerdrName: string | null = herdrAgentName;
+
+  const releaseHerdrName = () => {
+    if (reservedHerdrName) {
+      reservedHerdrNames.delete(reservedHerdrName);
+      reservedHerdrName = null;
+    }
+  };
+
+  const extraTakenHerdrNames = new Set<string>();
+  const reserveNextHerdrName = (extra?: Iterable<string>) => {
+    releaseHerdrName();
+    if (extra) {
+      for (const name of extra) extraTakenHerdrNames.add(name);
+    }
+    const taken = sessionHerdrNames(artifactDir);
+    for (const name of extraTakenHerdrNames) taken.add(name);
+    herdrAgentName = pickHerdrAgentName(baseHerdrName, taken);
+    reservedHerdrNames.add(herdrAgentName);
+    reservedHerdrName = herdrAgentName;
+    return herdrAgentName;
+  };
+
+  let herdrRegistered = false;
+
   try {
+    // Cross-session names are server-global and invisible to the session
+    // registry. An unreadable inventory is "unknown", not "free": keep the
+    // base name and let `agent_name_taken` drive the retry below.
+    const liveNames = await listLiveAgentNames();
+    if (liveNames?.has(herdrAgentName)) {
+      reserveNextHerdrName(liveNames);
+    }
+
+    // Build after the name is known so every name-derived value (including the
+    // protocol record file) uses the final Herdr name.
+    const plan = adapter.buildLaunch({
+      platform: process.platform,
+      id,
+      displayName,
+      herdrAgentName,
+      task: params.task,
+      taskDelivery: launchBehavior.taskDelivery,
+      cwd: targetCwdForSession,
+      model: effectiveModel ?? null,
+      parentModel: formatParentModel(ctx.model),
+      thinking: effectiveThinking ?? null,
+      agentName: agentName ?? null,
+      agent: agentDefs,
+      loadout,
+      artifactDir,
+      sessionFile: subagentSessionFile,
+      activityFile,
+      subagentDonePath: join(SUBAGENTS_DIR, "subagent-done.ts"),
+      autoExit: childAutoExit,
+      interactive: effectiveInteractive,
+      spawnable: agentDefs?.subagentAgents ?? null,
+      agentDir: resolvedAgentDir,
+      effectiveTools,
+      effectiveSkills,
+      grantSpawning,
+      fullTask,
+    });
+
     // Surface creation lives inside the launch try so a failure after the pane
     // exists still cleans it up instead of leaking an orphan.
     surface =
@@ -546,9 +643,23 @@ export async function launchSubagent(
     let capturedSessionId: string | undefined;
 
     if (adapter.id === "pi") {
-      try {
-        await startAgentWithReadiness(herdrAgentName, "pi", surface, plan.startArgs);
-      } catch {
+      for (let attempt = 0; attempt < MAX_HERDR_NAME_ATTEMPTS; attempt++) {
+        try {
+          await startAgentWithReadiness(herdrAgentName, "pi", surface, plan.startArgs);
+          herdrRegistered = true;
+          break;
+        } catch (err) {
+          if (isHerdrNameTaken(err) && attempt + 1 < MAX_HERDR_NAME_ATTEMPTS) {
+            extraTakenHerdrNames.add(herdrAgentName);
+            reserveNextHerdrName(liveNames ?? undefined);
+            continue;
+          }
+          // Any other failure keeps the historical Pi behavior: run the shell
+          // command directly instead of failing the spawn.
+          break;
+        }
+      }
+      if (!herdrRegistered) {
         // Last resort for Pi: run the shell command directly. If this also
         // fails, the outer catch closes the pane and reports the error.
         sendLongCommand(surface, plan.fallbackCommand ?? "", {
@@ -557,15 +668,28 @@ export async function launchSubagent(
         });
       }
     } else {
-      capturedSessionId = await startAgentOnSurface({
-        name: herdrAgentName,
-        kind: adapter.id,
-        surface,
-        startArgs: plan.startArgs,
-        prompt: plan.prompt ?? params.task,
-        startTimeoutMs: startTimeoutFor(adapter.id),
-        readyTimeoutMs: readyTimeoutFor(adapter.id),
-      });
+      for (let attempt = 0; attempt < MAX_HERDR_NAME_ATTEMPTS; attempt++) {
+        try {
+          capturedSessionId = await startAgentOnSurface({
+            name: herdrAgentName,
+            kind: adapter.id,
+            surface,
+            startArgs: plan.startArgs,
+            prompt: plan.prompt ?? params.task,
+            startTimeoutMs: startTimeoutFor(adapter.id),
+            readyTimeoutMs: readyTimeoutFor(adapter.id),
+          });
+          herdrRegistered = true;
+          break;
+        } catch (err) {
+          if (isHerdrNameTaken(err) && attempt + 1 < MAX_HERDR_NAME_ATTEMPTS) {
+            extraTakenHerdrNames.add(herdrAgentName);
+            reserveNextHerdrName(liveNames ?? undefined);
+            continue;
+          }
+          throw err;
+        }
+      }
     }
 
     const running = createRunningSubagent({
@@ -573,6 +697,7 @@ export async function launchSubagent(
       name: displayName,
       parentSessionId: sessionId,
       herdrAgentName,
+      herdrRegistered,
       task: params.task,
       agent: agentName,
       cli: adapter.id,
@@ -593,9 +718,15 @@ export async function launchSubagent(
     return running;
   } catch (err) {
     if (surface && !surfacePreCreated) {
-      terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
+      terminateSurface(surface, {
+        agentName: herdrAgentName,
+        herdrRegistered,
+        closePane: true,
+      });
     }
     throw err;
+  } finally {
+    releaseHerdrName();
   }
 }
 
@@ -790,7 +921,11 @@ export async function resumeSubagent(input: ResumeInput): Promise<ResumeOutcome>
     if (pane) {
       const owned = !pane.agent || paneShowsAgent(pane, herdrAgentName, adapter.id);
       if (owned) {
-        const outcome = terminateSurface(entry.surface, { agentName: herdrAgentName, closePane: true });
+        const outcome = terminateSurface(entry.surface, {
+          agentName: herdrAgentName,
+          herdrRegistered: entry.herdrRegistered,
+          closePane: true,
+        });
         if (!outcome.ok && !outcome.paneClosed) {
           return resumeError(
             "leftover_pane",
@@ -848,12 +983,16 @@ export async function resumeSubagent(input: ResumeInput): Promise<ResumeOutcome>
       });
     }
   } catch (err: any) {
-    terminateSurface(surface, { agentName: herdrAgentName, closePane: true });
+    terminateSurface(surface, {
+      agentName: herdrAgentName,
+      herdrRegistered: false,
+      closePane: true,
+    });
     const reason = err?.message ?? String(err);
-    if (/agent_pane_busy/i.test(reason)) {
+    if (/agent_pane_busy|agent_name_taken/i.test(reason)) {
       return resumeError(
         "leftover_pane",
-        `Subagent "${name}" still has a live agent or pane that could not be closed. ` +
+        `Subagent "${name}" still has a live agent under its name or pane. ` +
           `Stop it first with subagent_stop({ name: "${name}" }) and retry.`,
       );
     }
@@ -875,6 +1014,7 @@ export async function resumeSubagent(input: ResumeInput): Promise<ResumeOutcome>
     name,
     parentSessionId,
     herdrAgentName,
+    herdrRegistered: plan.mode === "agent",
     task: message,
     agent: loadout?.agent ?? undefined,
     cli: adapter.id,

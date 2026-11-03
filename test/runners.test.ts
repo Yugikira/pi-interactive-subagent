@@ -372,7 +372,7 @@ describe("adapter result extraction", () => {
   });
 
   it("builds a protocol record prompt and reads the record back", () => {
-    const recordFile = join(dir, ".pi", "temp", "subagent-records", "scout.jsonl");
+    const recordFile = join(dir, ".pi", "temp", "subagent-records", "scout-abc123.jsonl");
     const ctx = makeCtx({ cwd: dir, herdrAgentName: "scout" });
 
     const protocolPlan = getRunner("codex")!.buildLaunch(ctx);
@@ -390,6 +390,19 @@ describe("adapter result extraction", () => {
       ),
       { summary: "codex done" },
     );
+  });
+
+  it("keys protocol record files by spawn id so same-named agents cannot share one", () => {
+    const first = getRunner("codex")!.buildLaunch(
+      makeCtx({ cwd: dir, herdrAgentName: "scout", id: "abc123" }),
+    ).recordFile;
+    const second = getRunner("codex")!.buildLaunch(
+      makeCtx({ cwd: dir, herdrAgentName: "scout", id: "def456" }),
+    ).recordFile;
+
+    assert.ok(first?.endsWith("scout-abc123.jsonl"));
+    assert.ok(second?.endsWith("scout-def456.jsonl"));
+    assert.notEqual(first, second);
   });
 
   it("extracts the last Claude assistant message from project transcript", () => {

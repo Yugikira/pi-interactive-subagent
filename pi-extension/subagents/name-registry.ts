@@ -27,6 +27,9 @@ export function registryEntryForRunning(
     runner: running.cli,
     surface: running.surface,
     herdrAgentName: running.herdrAgentName,
+    ...(running.herdrRegistered !== undefined
+      ? { herdrRegistered: running.herdrRegistered }
+      : {}),
     ...(running.cwd ? { cwd: running.cwd } : {}),
     ...(running.cli !== "pi" && running.launchArgs ? { launchArgs: running.launchArgs } : {}),
   };

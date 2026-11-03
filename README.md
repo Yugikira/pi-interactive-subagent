@@ -78,6 +78,30 @@ subagent({ cli: "opencode", task: "Scan package dependencies" });
 | `cwd` | string | caller cwd | Working directory for the sub-agent |
 | `keepOpen` | boolean | `false` | Keep the pane open after the task completes. For `pi` this also suppresses the child's auto-exit, so the session stays alive and steerable; each turn's result is still delivered automatically |
 
+### Working directory
+
+A sub-agent runs in its Herdr pane's working directory. The resolution differs by
+source:
+
+- **Default** — the spawner session's working directory (`ctx.cwd`).
+- **`subagent({ cwd })`** — resolved against the current process's working
+  directory. Pass an absolute path when the result must not depend on where the
+  orchestrator was started.
+- **Agent profile `cwd:`** — resolved against the agent config directory
+  (`~/.pi/agent`, or `PI_CODING_AGENT_DIR` when set), *not* the project. This is
+  intentional: a global profile can run in a project-independent directory so it
+  does not inherit the project's `AGENTS.md`/`CLAUDE.md` or project `.pi`
+  configuration. Use an absolute path when a project-relative directory is
+  required.
+- **Profile discovery** — `.pi/agents` is discovered from the spawner's process
+  working directory, not from the selected sub-agent `cwd`. A sub-agent whose
+  `cwd` points at another project does not load that project's agent profiles.
+- **Pi only** — the child's session file is stored under the resolved agent
+  directory (`<agentDir>/sessions/--<encoded-cwd>--/`), and a `<cwd>/.pi/agent`
+  directory (when present) becomes the child's `PI_CODING_AGENT_DIR`. Other
+  runners receive the same pane cwd but use their own configuration and session
+  storage.
+
 ### Model resolution
 
 The bundled agents are provider-neutral. A model is resolved once per spawn, in this order:

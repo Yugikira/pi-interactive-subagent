@@ -101,6 +101,12 @@ export interface NameRegistryEntry {
   surface?: string;
   /** Herdr agent name for the pane above (absent on legacy entries). */
   herdrAgentName?: string;
+  /**
+   * Whether Herdr actually registered `herdrAgentName`. False for the Pi
+   * shell-fallback launch and Pi shell resume; those panes are targeted by
+   * `surface` instead. Absent on legacy entries (treated as registered).
+   */
+  herdrRegistered?: boolean;
   /** Working directory the runner was launched in (needed by native readers on resume). */
   cwd?: string;
   /**
