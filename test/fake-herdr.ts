@@ -33,6 +33,8 @@ export interface FakeAgent {
 
 export interface FakeHerdrOptions {
   paneListFailsTimes?: number;
+  /** Make `agent list` fail this many times (live-name inventory unreadable). */
+  agentListFailsTimes?: number;
   keyWriteFails?: boolean;
   /** Legacy allowlist for `agent send-keys` targets not registered via start. */
   agentNames?: string[];
@@ -63,12 +65,15 @@ export function createFakeHerdr(
 ) {
   const panes = new Map<string, FakePane>(Object.entries(initial));
   const agents = new Map<string, FakeAgent>();
+  const findAgentByPane = (paneId: string) =>
+    Array.from(agents.values()).find((agent) => agent.paneId === paneId);
   const extraAgentNames = new Set(options?.agentNames ?? []);
   const calls: string[][] = [];
   const keyWrites: string[][] = [];
   const prompts: Array<{ target: string; text: string }> = [];
   const runCommands: Array<{ paneId: string; command: string }> = [];
   let paneListFailures = options?.paneListFailsTimes ?? 0;
+  let agentListFailures = options?.agentListFailsTimes ?? 0;
   let splitCounter = 0;
 
   // Seed agents for panes that already carry a native session id.
@@ -171,6 +176,24 @@ export function createFakeHerdr(
       return "";
     }
 
+    if (group === "agent" && verb === "list") {
+      if (agentListFailures > 0) {
+        agentListFailures -= 1;
+        throw new Error(herdrError("internal_error", "agent inventory unavailable"));
+      }
+      return JSON.stringify({
+        result: {
+          agents: Array.from(agents.values()).map((agent) => ({
+            name: agent.name,
+            agent: agent.kind,
+            agent_status: agent.status,
+            pane_id: agent.paneId,
+            agent_session: { value: agent.sessionId },
+          })),
+        },
+      });
+    }
+
     if (group === "agent" && verb === "start") {
       const name = args[2];
       const kind = flagValue(args, "--kind") ?? "pi";
@@ -181,8 +204,12 @@ export function createFakeHerdr(
       if (options?.startFails) {
         throw new Error(herdrError("agent_start_failed", `agent ${name} failed to start`));
       }
+      const sameName = agents.get(name);
+      if (sameName && sameName.paneId !== paneId) {
+        throw new Error(herdrError("agent_name_taken", `agent name ${name} is already in use`));
+      }
       const occupying = Array.from(agents.values()).find((agent) => agent.paneId === paneId);
-      if (agents.has(name) || occupying) {
+      if (occupying || sameName) {
         throw new Error(
           herdrError("agent_pane_busy", `pane ${paneId} already has an agent`),
         );
@@ -199,8 +226,10 @@ export function createFakeHerdr(
 
     if (group === "agent" && verb === "prompt") {
       const target = args[2];
-      const agent = agents.get(target);
-      if (!agent && !extraAgentNames.has(target)) {
+      const agent = agents.get(target) ?? findAgentByPane(target);
+      // A pane id is a valid agent target even when the fallback agent was not
+      // registered by name (Herdr detects the process in the pane).
+      if (!agent && !extraAgentNames.has(target) && !panes.has(target)) {
         throw new Error(herdrError("agent_not_found", `agent target ${target} not found`));
       }
       prompts.push({ target, text: args[3] ?? "" });
@@ -208,7 +237,7 @@ export function createFakeHerdr(
     }
 
     if (group === "agent" && verb === "get") {
-      const agent = agents.get(args[2]);
+      const agent = agents.get(args[2]) ?? findAgentByPane(args[2]);
       if (!agent) {
         throw new Error(herdrError("agent_not_found", `agent target ${args[2]} not found`));
       }

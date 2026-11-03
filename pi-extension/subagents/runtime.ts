@@ -41,6 +41,12 @@ export interface RunningSubagent {
   /** Session that spawned this subagent; shutdown only clears its own. */
   parentSessionId?: string;
   herdrAgentName: string;
+  /**
+   * Whether Herdr actually registered `herdrAgentName`. False for the Pi
+   * shell-fallback launch and Pi shell resume; those panes must be targeted by
+   * surface id, never by a name another live agent might own.
+   */
+  herdrRegistered?: boolean;
   task: string;
   agent?: string;
   cli: CanonicalRunner;
@@ -89,6 +95,15 @@ export const runningSubagents: Map<string, RunningSubagent> =
 const RESERVED_NAMES_KEY = Symbol.for("pi-subagents/reserved-names");
 export const reservedNames: Set<string> =
   ((globalThis as any)[RESERVED_NAMES_KEY] ??= new Set<string>());
+
+/**
+ * Herdr names claimed by spawns that are mid-launch. Herdr names are unique
+ * across the whole server and must be reserved synchronously: parallel spawns
+ * run their synchronous prefix before any of them reaches an await.
+ */
+const RESERVED_HERDR_NAMES_KEY = Symbol.for("pi-subagents/reserved-herdr-names");
+export const reservedHerdrNames: Set<string> =
+  ((globalThis as any)[RESERVED_HERDR_NAMES_KEY] ??= new Set<string>());
 
 /** Panes created by this extension, used for smart tiling. */
 const TRACKED_SURFACES_KEY = Symbol.for("pi-subagents/tracked-surfaces");

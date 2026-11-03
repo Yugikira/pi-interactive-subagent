@@ -7,6 +7,7 @@
  * - Multi-runner normalization: pi, agy, claude, codex, grok, opencode
  */
 import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { existsSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -164,17 +165,32 @@ function requireHerdr(): void {
 
 export { shellEscape } from "./shell.ts";
 
+/** Stable six-hex suffix for names that would otherwise sanitize lossily. */
+function nameHash(name: string): string {
+  return createHash("sha1").update(name).digest("hex").slice(0, 6);
+}
+
 /**
  * Herdr agent names must match `^[a-z][a-z0-9_-]{0,31}$` and be unique among live agents.
+ *
+ * Names containing non-ASCII characters get a deterministic hash suffix. Without
+ * it, every all-CJK name collapses to `sub-` (and `侦察-2` collapses to
+ * `sub-2`), so two different display names would map to the same Herdr name.
  */
 export function sanitizeAgentName(name: string): string {
+  const hasNonAscii = /[^\x00-\x7F]/.test(name);
   let cleaned = name
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, "-")
     .replace(/^-+/, "")
     .slice(0, 32);
 
-  if (!cleaned || !/^[a-z]/.test(cleaned)) {
+  if (hasNonAscii) {
+    const stem = /[a-z0-9]/.test(cleaned) ? cleaned : "sub";
+    const prefixed = /^[a-z]/.test(stem) ? stem : `sub-${stem}`;
+    const suffix = `-${nameHash(name)}`;
+    cleaned = `${prefixed.slice(0, 32 - suffix.length)}${suffix}`;
+  } else if (!cleaned || !/^[a-z]/.test(cleaned)) {
     cleaned = `sub-${cleaned}`.slice(0, 32);
   }
 
@@ -688,6 +704,8 @@ export interface TerminateOutcome {
 
 export interface TerminateSurfaceOptions {
   agentName?: string;
+  /** False when the agent was started without Herdr registering its name. */
+  herdrRegistered?: boolean;
   closePane?: boolean;
 }
 
@@ -733,7 +751,9 @@ export function terminateSurface(
   // the real failure.
   const agentName = options?.agentName;
   const canUseAgent =
-    !!agentName && (panes === null || knownAgent === agentName);
+    !!agentName &&
+    options?.herdrRegistered !== false &&
+    (panes === null || knownAgent === agentName);
   if (canUseAgent && agentName) {
     let agentError: string | null = null;
     try {
@@ -1020,6 +1040,57 @@ export async function getAgentStateAsync(target: string): Promise<AgentInfo | nu
   try {
     const raw = await execHerdrAsync(["agent", "get", target], { timeout: 3_000 });
     return parseAgentInfo(parseHerdrJson(raw), target);
+  } catch {
+    return null;
+  }
+}
+
+/** Parse `herdr agent list` into named agents. Unnamed detected agents are skipped. */
+export function parseAgentList(raw: string): AgentInfo[] | null {
+  let data: any;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const agents = data?.result?.agents ?? data?.agents;
+  if (!Array.isArray(agents)) return null;
+
+  const parsed: AgentInfo[] = [];
+  for (const agent of agents) {
+    if (!agent || typeof agent !== "object") continue;
+    if (typeof agent.name !== "string" || agent.name === "") continue;
+    const rawState = (agent.agent_status ?? agent.state ?? agent.status ?? "unknown") as string;
+    const sessionVal =
+      agent.agent_session?.value ??
+      agent.agent_session_id ??
+      agent.agent_session?.id;
+    parsed.push({
+      name: agent.name,
+      kind: agent.agent ?? agent.kind,
+      state: rawState as HerdrAgentStateKind,
+      paneId: agent.pane_id,
+      sessionId: typeof sessionVal === "string" ? sessionVal : undefined,
+      raw: agent,
+    });
+  }
+  return parsed;
+}
+
+/**
+ * Every named live agent on this Herdr server.
+ *
+ * `null` means the inventory could not be read. Callers must not treat that as
+ * "no names are taken"; they should attempt the base name and rely on Herdr's
+ * `agent_name_taken` error to detect a real collision.
+ */
+export async function listLiveAgentNames(): Promise<Set<string> | null> {
+  if (!isHerdrAvailable()) return null;
+  try {
+    const raw = await execHerdrAsync(["agent", "list"], { timeout: 5_000 });
+    const agents = parseAgentList(raw);
+    if (!agents) return null;
+    return new Set(agents.map((agent) => agent.name).filter(Boolean));
   } catch {
     return null;
   }

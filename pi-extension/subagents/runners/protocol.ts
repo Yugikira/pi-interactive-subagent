@@ -24,7 +24,9 @@ export function formatNonPiPrompt(task: string, recordFile: string, turn: number
 }
 
 export function buildProtocolLaunch(ctx: RunnerLaunchContext): LaunchPlan {
-  const recordFile = getSubagentRecordPath(ctx.cwd, ctx.herdrAgentName);
+  // The spawn id keeps two same-named agents in the same cwd from sharing a
+  // record file; the Herdr name alone is only unique among live agents.
+  const recordFile = getSubagentRecordPath(ctx.cwd, `${ctx.herdrAgentName}-${ctx.id}`);
   mkdirSync(dirname(recordFile), { recursive: true });
   return {
     startArgs: [],

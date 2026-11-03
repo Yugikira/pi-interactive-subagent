@@ -8,6 +8,7 @@ import {
   isHerdrAvailable,
   listPanes,
   promptAgent,
+  sanitizeAgentName,
   sendAgentKeys,
   sendCommand,
   sendPaneKeys,
@@ -36,14 +37,21 @@ import { watchAndDeliver } from "./turn.ts";
  * the spawner's persistent registry — so a defaulted name never collides with a
  * finished subagent either. This lets `subagent_message({ name })` address any
  * subagent of this session unambiguously, running or finished.
+ *
+ * Uniqueness is compared on the *sanitized Herdr name*, not the raw display
+ * name: `Scout` and `scout` both become `scout`, and a second child that kept
+ * its display name would otherwise collide in Herdr and steer the wrong agent.
  */
 export function uniqueRunningName(base: string, registryNames?: Set<string>): string {
-  const taken = new Set(Array.from(runningSubagents.values()).map((r) => r.name));
-  for (const reserved of reservedNames) taken.add(reserved);
-  if (registryNames) for (const n of registryNames) taken.add(n);
-  if (!taken.has(base)) return base;
+  const taken = new Set<string>();
+  for (const running of runningSubagents.values()) {
+    taken.add(sanitizeAgentName(running.name));
+  }
+  for (const reserved of reservedNames) taken.add(sanitizeAgentName(reserved));
+  if (registryNames) for (const name of registryNames) taken.add(sanitizeAgentName(name));
+  if (!taken.has(sanitizeAgentName(base))) return base;
   let n = 2;
-  while (taken.has(`${base}-${n}`)) n++;
+  while (taken.has(sanitizeAgentName(`${base}-${n}`))) n++;
   return `${base}-${n}`;
 }
 
@@ -88,20 +96,27 @@ export function steerSubagent(
     running.turnStartTime = now;
     running.completion?.resetTurn(now);
 
-    if (
-      running.herdrAgentName &&
-      isHerdrAvailable() &&
-      send === sendCommand
-    ) {
+    if (isHerdrAvailable() && send === sendCommand) {
       const promptText =
         running.recordFile && !isNativeSessionRunner(running.cli)
           ? formatNonPiPrompt(message, running.recordFile, nextTurn)
           : message;
+      // A name is only safe when Herdr registered it for this child. The Pi
+      // shell fallback has no registration; a same-named live agent elsewhere
+      // would otherwise receive the message.
+      if (running.herdrRegistered !== false && running.herdrAgentName) {
+        try {
+          promptAgent(running.herdrAgentName, promptText);
+          return { ok: true };
+        } catch {
+          // The pane id below is a safer second target.
+        }
+      }
       try {
-        promptAgent(running.herdrAgentName, promptText);
+        promptAgent(running.surface, promptText);
         return { ok: true };
       } catch {
-        // Fallback to sending command to surface directly
+        // Fall through to the raw pane-command path.
       }
     }
     const flattened = message.replace(/\s*\n\s*/g, " ").trim();
@@ -172,6 +187,10 @@ export function defaultInterrupt(running: RunningSubagent): void {
     sendPaneKeys(running.surface, ["Escape"]);
   } catch {
     // The agent registration can outlive the pane id in rare reload states.
+    // Never fall back to a name Herdr did not register for this child.
+    if (running.herdrRegistered === false || !running.herdrAgentName) throw new Error(
+      `pane ${running.surface} is gone and the agent has no registered Herdr name`,
+    );
     sendAgentKeys(running.herdrAgentName, ["Escape"]);
   }
 }
@@ -234,6 +253,7 @@ export function terminateRunning(
 ): TerminateOutcome {
   return terminateSurface(running.surface, {
     agentName: running.herdrAgentName,
+    herdrRegistered: running.herdrRegistered,
     closePane,
   });
 }
@@ -305,6 +325,7 @@ export function stopCompletedByName(
 
   const outcome = terminateSurface(entry.surface, {
     agentName: entry.herdrAgentName,
+    herdrRegistered: entry.herdrRegistered,
     closePane,
   });
   const stopped = outcome.ok || outcome.paneClosed;

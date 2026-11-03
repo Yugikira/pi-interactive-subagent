@@ -2694,6 +2694,42 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("uniqueRunningName dedupes on the sanitized Herdr name", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({ id: "a1", name: "scout", surface: "a1" }));
+      assert.equal(testApi.uniqueRunningName("Scout"), "Scout-2");
+      assert.equal(sanitizeAgentName("Scout-2"), "scout-2");
+
+      runningMap.clear();
+      runningMap.set("a1", makeRunning({ id: "a1", name: "侦察", surface: "a1" }));
+      const second = testApi.uniqueRunningName("侦察");
+      assert.notEqual(sanitizeAgentName(second), sanitizeAgentName("侦察"));
+      // Different non-ASCII names do not collide with each other.
+      assert.equal(testApi.uniqueRunningName("测试"), "测试");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("pickHerdrAgentName suffixes without exceeding Herdr's 32-char limit", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(testApi.pickHerdrAgentName("worker", new Set()), "worker");
+    assert.equal(testApi.pickHerdrAgentName("worker", new Set(["worker"])), "worker-2");
+    assert.equal(
+      testApi.pickHerdrAgentName("worker", new Set(["worker", "worker-2"])),
+      "worker-3",
+    );
+
+    const base = "a".repeat(32);
+    const picked = testApi.pickHerdrAgentName(base, new Set([base]));
+    assert.equal(picked, `${"a".repeat(30)}-2`);
+    assert.ok(picked.length <= 32);
+  });
+
   it("steers a running subagent by typing into its pane (newlines flattened)", () => {
     const testApi = (subagentsModule as any).__test__;
     let sentSurface = "";
@@ -3653,6 +3689,19 @@ describe("herdr.ts", () => {
       const longName = "this-is-a-very-long-agent-name-that-exceeds-32-characters";
       assert.ok(sanitizeAgentName(longName).length <= 32);
     });
+
+    it("keeps distinct non-ASCII names distinct with a deterministic hash", () => {
+      const first = sanitizeAgentName("侦察");
+      const second = sanitizeAgentName("测试");
+      assert.match(first, /^sub-[0-9a-f]{6}$/);
+      assert.match(second, /^sub-[0-9a-f]{6}$/);
+      assert.notEqual(first, second);
+      assert.equal(first, sanitizeAgentName("侦察"));
+    });
+
+    it("does not collapse non-ASCII names with numeric suffixes onto each other", () => {
+      assert.notEqual(sanitizeAgentName("侦察-2"), sanitizeAgentName("测试-2"));
+    });
   });
 
   describe("resolveRunnerAndAgent", () => {
@@ -4160,6 +4209,174 @@ describe("herdr.ts", () => {
           rmSync(sessionDir, { recursive: true, force: true });
         }
       });
+    });
+  });
+
+  describe("Herdr name namespace hardening", () => {
+    async function spawnViaTool(
+      sessionDir: string,
+      parentId: string,
+      params: Record<string, unknown>,
+    ) {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((candidate: any) => candidate.name === "subagent");
+      assert.ok(tool, "expected subagent tool");
+      const ctx = {
+        sessionManager: {
+          getSessionFile: () => join(sessionDir, "parent.jsonl"),
+          getSessionId: () => parentId,
+          getSessionDir: () => sessionDir,
+        },
+        cwd: process.cwd(),
+        model: null,
+      };
+      return tool.execute("call-spawn", params, undefined, undefined, ctx);
+    }
+
+    async function withSpawnEnv(
+      fake: ReturnType<typeof createFakeHerdr>,
+      run: (sessionDir: string, parentId: string, testApi: any) => Promise<void>,
+    ) {
+      await withIsolatedAgentEnv(async () => {
+        const prevDelay = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+        const prevPane = process.env.HERDR_PANE_ID;
+        process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+        process.env.HERDR_PANE_ID = "caller-pane";
+
+        const restoreHerdr = setHerdrExecDeps(fake.deps);
+        const sessionDir = createTestDir();
+        const parentId = "name-parent";
+        const testApi = (subagentsModule as any).__test__;
+        testApi.runningSubagents.clear();
+
+        try {
+          await run(sessionDir, parentId, testApi);
+        } finally {
+          stopMonitor();
+          testApi.runningSubagents.clear();
+          testApi.reservedNames.clear();
+          testApi.reservedHerdrNames.clear();
+          restoreHerdr();
+          restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", prevDelay);
+          restoreEnvVar("HERDR_PANE_ID", prevPane);
+          rmSync(sessionDir, { recursive: true, force: true });
+        }
+      });
+    }
+
+    it("suffixes the Herdr name when another live session already owns it", async () => {
+      const world = createFakeHerdr({
+        "other-pane": { agent: "worker", sessionId: "other-session" },
+      });
+
+      await withSpawnEnv(world, async (sessionDir, parentId, testApi) => {
+        const result = await spawnViaTool(sessionDir, parentId, {
+          cli: "claude",
+          task: "do it",
+          name: "worker",
+        });
+        assert.equal(result.details.status, "started");
+
+        const running = Array.from(testApi.runningSubagents.values())[0] as any;
+        assert.equal(running.name, "worker");
+        assert.equal(running.herdrAgentName, "worker-2");
+        assert.equal(running.herdrRegistered, true);
+        assert.ok(
+          world.calls.some(
+            (args) => args[0] === "agent" && args[1] === "start" && args[2] === "worker-2",
+          ),
+          "expected agent start with the suffixed Herdr name",
+        );
+
+        const artifactDir = join(sessionDir, "artifacts", parentId);
+        const entry = readNameRegistry(artifactDir)["worker"];
+        assert.ok(entry, "expected the name registry entry");
+        assert.equal(entry.herdrAgentName, "worker-2");
+        assert.equal(entry.herdrRegistered, true);
+      });
+    });
+
+    it("retries with the next suffix after an agent_name_taken race", async () => {
+      const world = createFakeHerdr(
+        { "other-pane": { agent: "worker", sessionId: "other-session" } },
+        { agentListFailsTimes: 1 },
+      );
+
+      await withSpawnEnv(world, async (sessionDir, parentId, testApi) => {
+        const result = await spawnViaTool(sessionDir, parentId, {
+          cli: "claude",
+          task: "do it",
+          name: "worker",
+        });
+        assert.equal(result.details.status, "started");
+
+        const running = Array.from(testApi.runningSubagents.values())[0] as any;
+        assert.equal(running.name, "worker");
+        assert.equal(running.herdrAgentName, "worker-2");
+        assert.equal(running.herdrRegistered, true);
+
+        const startNames = world.calls
+          .filter((args) => args[0] === "agent" && args[1] === "start")
+          .map((args) => args[2]);
+        assert.deepEqual(startNames, ["worker", "worker-2"]);
+      });
+    });
+
+    it("marks the Pi shell fallback as unregistered and steers it by pane", async () => {
+      const world = createFakeHerdr({}, { startFails: true });
+
+      await withSpawnEnv(world, async (sessionDir, parentId, testApi) => {
+        const result = await spawnViaTool(sessionDir, parentId, {
+          cli: "pi",
+          task: "do it",
+          name: "fallback-bot",
+        });
+        assert.equal(result.details.status, "started");
+
+        const running = Array.from(testApi.runningSubagents.values())[0] as any;
+        assert.equal(running.name, "fallback-bot");
+        assert.equal(running.herdrRegistered, false);
+
+        const steered = steerSubagent(running, "follow-up");
+        assert.deepEqual(steered, { ok: true });
+        assert.deepEqual(world.prompts.at(-1), {
+          target: running.surface,
+          text: "follow-up",
+        });
+        assert.ok(
+          !world.prompts.some((prompt) => prompt.target === "fallback-bot"),
+          "fallback agents must not be steered by an unregistered name",
+        );
+
+        const artifactDir = join(sessionDir, "artifacts", parentId);
+        const entry = readNameRegistry(artifactDir)["fallback-bot"];
+        assert.ok(entry, "expected the name registry entry");
+        assert.equal(entry.herdrRegistered, false);
+      });
+    });
+
+    it("does not target an unregistered name when the pane inventory is unreadable", () => {
+      const world = createFakeHerdr(
+        { "pane-x": {} },
+        { paneListFailsTimes: 1, agentNames: ["worker"] },
+      );
+      const restore = setHerdrExecDeps(world.deps);
+      try {
+        const outcome = terminateSurface("pane-x", {
+          agentName: "worker",
+          herdrRegistered: false,
+          closePane: false,
+        });
+        assert.equal(outcome.ok, true);
+        assert.ok(world.keyWrites.some((keys) => keys[0] === "pane:pane-x"));
+        assert.ok(
+          !world.keyWrites.some((keys) => keys[0] === "agent:worker"),
+          "must not send keys to a name Herdr did not register for this pane",
+        );
+      } finally {
+        restore();
+      }
     });
   });
 
